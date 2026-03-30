@@ -1,7 +1,7 @@
 mod db;
 mod routes;
 
-use axum::{routing::{get, post}, Router};
+use axum::{routing::{delete, get, post, put}, Router};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -21,6 +21,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/nodes/register", post(routes::register_node))
         .route("/api/nodes/{id}/heartbeat", post(routes::heartbeat))
         .route("/api/nodes", get(routes::list_nodes))
+        .route("/api/nodes/{id}/assignments", get(routes::get_assignments))
+        .route("/api/deployments", get(routes::list_deployments).post(routes::create_deployment))
+        .route("/api/deployments/{id}/status", put(routes::update_deployment_status))
+        .route("/api/deployments/{id}", delete(routes::delete_deployment))
         .layer(TraceLayer::new_for_http())
         .with_state(pool);
 

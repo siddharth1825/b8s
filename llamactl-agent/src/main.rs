@@ -1,4 +1,5 @@
 mod detect;
+mod runner;
 
 use anyhow::{Context, Result};
 use llamactl_common::*;
@@ -34,10 +35,12 @@ async fn main() -> Result<()> {
     tracing::info!(
         node_id = %node_id,
         interval_secs = interval,
-        "Registered with server, starting heartbeat loop"
+        "Registered with server, starting heartbeat + deployment loop"
     );
 
-    heartbeat_loop(&client, &server_url, node_id, interval).await
+    let mut runner = runner::Runner::new(client.clone(), server_url.clone(), hw.backend);
+
+    run_loop(&client, &server_url, node_id, interval, &mut runner).await
 }
 
 async fn register(
@@ -69,29 +72,30 @@ async fn register(
     Ok((resp.node_id, resp.heartbeat_interval_secs))
 }
 
-async fn heartbeat_loop(
+async fn run_loop(
     client: &reqwest::Client,
     server_url: &str,
     node_id: Uuid,
     interval_secs: u64,
+    runner: &mut runner::Runner,
 ) -> Result<()> {
-    let url = format!("{server_url}/api/nodes/{node_id}/heartbeat");
+    let heartbeat_url = format!("{server_url}/api/nodes/{node_id}/heartbeat");
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
 
     loop {
         interval.tick().await;
 
+        // Send heartbeat
         let (ram_used_mb, cpu_usage_pct) = detect::collect_metrics();
-
         let req = HeartbeatRequest {
-            vram_used_mb: None, // TODO: read from GPU runtime
+            vram_used_mb: None,
             ram_used_mb,
             cpu_usage_pct,
-            gpu_temp_c: None,     // TODO: read from GPU
-            tokens_per_sec: None, // TODO: read from inference runtime
+            gpu_temp_c: None,
+            tokens_per_sec: None,
         };
 
-        match client.post(&url).json(&req).send().await {
+        match client.post(&heartbeat_url).json(&req).send().await {
             Ok(resp) if resp.status().is_success() => {
                 tracing::debug!("Heartbeat sent");
             }
@@ -102,5 +106,8 @@ async fn heartbeat_loop(
                 tracing::error!(err = %e, "Heartbeat failed — will retry");
             }
         }
+
+        // Poll for deployment assignments and reconcile
+        runner.poll(node_id).await;
     }
 }

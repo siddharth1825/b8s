@@ -13,8 +13,11 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool> {
         .connect_with(opts)
         .await?;
 
-    // Run migrations inline (single file for now)
+    // Run migrations inline
     sqlx::query(include_str!("../migrations/001_init.sql"))
+        .execute(&pool)
+        .await?;
+    sqlx::query(include_str!("../migrations/002_deployments.sql"))
         .execute(&pool)
         .await?;
 

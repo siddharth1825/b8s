@@ -77,6 +77,86 @@ pub struct HeartbeatResponse {
     pub ok: bool,
 }
 
+// ── Deployment ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentStatus {
+    Pending,
+    Downloading,
+    Running,
+    Stopped,
+    Failed,
+}
+
+impl std::fmt::Display for DeploymentStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Downloading => write!(f, "downloading"),
+            Self::Running => write!(f, "running"),
+            Self::Stopped => write!(f, "stopped"),
+            Self::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployRequest {
+    /// Model identifier — HuggingFace repo or local path
+    /// e.g. "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF" or "/path/to/model.gguf"
+    pub model: String,
+    /// Optional: pin to a specific node by ID
+    pub node_id: Option<Uuid>,
+    /// Context length (default: 2048)
+    pub context_length: Option<u32>,
+    /// GPU layers to offload (default: all, i.e. 9999)
+    pub gpu_layers: Option<u32>,
+    /// Port for the inference server on the worker (default: 8080)
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployResponse {
+    pub deployment_id: Uuid,
+    pub node_id: Uuid,
+    pub node_hostname: String,
+    pub status: DeploymentStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentInfo {
+    pub id: Uuid,
+    pub model: String,
+    pub node_id: Uuid,
+    pub node_hostname: String,
+    pub status: DeploymentStatus,
+    pub port: u16,
+    pub context_length: u32,
+    pub gpu_layers: u32,
+    pub endpoint: Option<String>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Returned to agent when it polls for work
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeAssignment {
+    pub deployment_id: Uuid,
+    pub model: String,
+    pub port: u16,
+    pub context_length: u32,
+    pub gpu_layers: u32,
+}
+
+/// Agent reports back deployment status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentStatusUpdate {
+    pub status: DeploymentStatus,
+    pub endpoint: Option<String>,
+    pub error: Option<String>,
+}
+
 // ── Node info (returned by GET /api/nodes) ──────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
