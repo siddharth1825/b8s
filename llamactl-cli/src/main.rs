@@ -1,7 +1,8 @@
+mod tui;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use llamactl_common::*;
-use std::io::{self, Write};
 
 #[derive(Parser)]
 #[command(name = "llamactl", about = "kubectl for local LLM clusters")]
@@ -37,6 +38,10 @@ enum Commands {
         /// GPU layers to offload (default: all)
         #[arg(long, default_value = "9999")]
         gpu_layers: u32,
+        /// Split model across multiple nodes (llama.cpp RPC tensor splitting)
+        /// Comma-separated node IDs: first is main, rest are RPC workers
+        #[arg(long, value_delimiter = ',')]
+        split: Vec<uuid::Uuid>,
     },
     /// Stop a running deployment
     Stop {
@@ -65,8 +70,8 @@ async fn main() -> Result<()> {
             GetResource::Deployments => get_deployments(&cli.server).await?,
         },
         Commands::Deploy {
-            model, node, port, context_length, gpu_layers,
-        } => deploy(&cli.server, model, node, port, context_length, gpu_layers).await?,
+            model, node, port, context_length, gpu_layers, split,
+        } => deploy(&cli.server, model, node, port, context_length, gpu_layers, split).await?,
         Commands::Stop { deployment_id } => stop(&cli.server, deployment_id).await?,
         Commands::Top => top(&cli.server).await?,
     }
@@ -154,13 +159,21 @@ async fn deploy(
     port: u16,
     context_length: u32,
     gpu_layers: u32,
+    split: Vec<uuid::Uuid>,
 ) -> Result<()> {
+    let node_id = if !split.is_empty() {
+        Some(split[0]) // Main node is first in split list
+    } else {
+        node
+    };
+
     let req = DeployRequest {
         model,
-        node_id: node,
+        node_id,
         port: Some(port),
         context_length: Some(context_length),
         gpu_layers: Some(gpu_layers),
+        split_nodes: split.clone(),
     };
 
     let resp: DeployResponse = reqwest::Client::new()
@@ -178,7 +191,14 @@ async fn deploy(
     println!("  ID:     {}", resp.deployment_id);
     println!("  Node:   {} ({})", resp.node_hostname, resp.node_id);
     println!("  Status: {}", resp.status);
-    println!("\nThe agent on {} will pick this up within ~10 seconds.", resp.node_hostname);
+    if split.len() > 1 {
+        println!("  Mode:   split across {} nodes (llama.cpp RPC)", split.len());
+        println!("          main: {}", split[0]);
+        for (i, worker) in split.iter().skip(1).enumerate() {
+            println!("          rpc-worker-{}: {}", i + 1, worker);
+        }
+    }
+    println!("\nAgents will pick this up within ~10 seconds.");
     println!("Check status: llamactl get deployments");
 
     Ok(())
@@ -198,94 +218,5 @@ async fn stop(server: &str, deployment_id: uuid::Uuid) -> Result<()> {
 }
 
 async fn top(server: &str) -> Result<()> {
-    // Clear screen escape + hide cursor
-    print!("\x1b[?25l");
-
-    // Handle Ctrl+C gracefully
-    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let r = running.clone();
-    ctrlc::set_handler(move || {
-        r.store(false, std::sync::atomic::Ordering::SeqCst);
-    })?;
-
-    while running.load(std::sync::atomic::Ordering::SeqCst) {
-        // Clear screen, move cursor to top-left
-        print!("\x1b[2J\x1b[H");
-
-        let now = chrono::Local::now().format("%H:%M:%S");
-        println!("llamactl top — {} (Ctrl+C to quit)\n", now);
-
-        // Fetch nodes
-        let nodes: Vec<NodeInfo> = match reqwest::get(format!("{server}/api/nodes")).await {
-            Ok(r) => r.json().await.unwrap_or_default(),
-            Err(_) => { println!("  (server unreachable)"); vec![] }
-        };
-
-        println!("NODES ({}):", nodes.len());
-        println!(
-            "  {:<15}  {:<8}  {:<14}  {:<12}  {:<14}  {:<6}  {:<6}",
-            "HOSTNAME", "STATUS", "BACKEND", "VRAM", "RAM", "CORES", "CPU%"
-        );
-        for node in &nodes {
-            let vram = match (node.vram_used_mb, node.vram_mb) {
-                (Some(u), Some(t)) => format!("{}/{} MB", u, t),
-                (None, Some(t)) => format!("-/{} MB", t),
-                _ => "-".into(),
-            };
-            let status_colored = match node.status {
-                NodeStatus::Online => format!("\x1b[32m{:<8}\x1b[0m", "online"),
-                NodeStatus::Offline => format!("\x1b[31m{:<8}\x1b[0m", "offline"),
-                NodeStatus::Draining => format!("\x1b[33m{:<8}\x1b[0m", "draining"),
-            };
-            println!(
-                "  {:<15}  {}  {:<14}  {:<12}  {}/{} MB  {:<6}  {:.1}",
-                node.hostname, status_colored, node.backend,
-                vram, node.ram_used_mb, node.total_ram_mb,
-                node.cpu_cores, node.cpu_usage_pct,
-            );
-        }
-
-        // Fetch deployments
-        let deployments: Vec<DeploymentInfo> =
-            match reqwest::get(format!("{server}/api/deployments")).await {
-                Ok(r) => r.json().await.unwrap_or_default(),
-                Err(_) => vec![],
-            };
-
-        println!("\nDEPLOYMENTS ({}):", deployments.len());
-        if !deployments.is_empty() {
-            println!(
-                "  {:<30}  {:<15}  {:<10}  {:<6}  {}",
-                "MODEL", "NODE", "STATUS", "PORT", "ENDPOINT"
-            );
-            for d in &deployments {
-                let model_short = if d.model.len() > 28 {
-                    format!("..{}", &d.model[d.model.len()-26..])
-                } else {
-                    d.model.clone()
-                };
-                let status_colored = match d.status {
-                    DeploymentStatus::Running => format!("\x1b[32m{:<10}\x1b[0m", "running"),
-                    DeploymentStatus::Pending => format!("\x1b[33m{:<10}\x1b[0m", "pending"),
-                    DeploymentStatus::Downloading => format!("\x1b[33m{:<10}\x1b[0m", "downloading"),
-                    DeploymentStatus::Failed => format!("\x1b[31m{:<10}\x1b[0m", "failed"),
-                    DeploymentStatus::Stopped => format!("\x1b[90m{:<10}\x1b[0m", "stopped"),
-                };
-                println!(
-                    "  {:<30}  {:<15}  {}  {:<6}  {}",
-                    model_short, d.node_hostname, status_colored, d.port,
-                    d.endpoint.as_deref().unwrap_or("-"),
-                );
-            }
-        }
-
-        io::stdout().flush()?;
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    }
-
-    // Show cursor again
-    print!("\x1b[?25h");
-    io::stdout().flush()?;
-    println!();
-    Ok(())
+    tui::run(server).await
 }

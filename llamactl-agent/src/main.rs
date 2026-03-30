@@ -87,12 +87,14 @@ async fn run_loop(
 
         // Send heartbeat
         let (ram_used_mb, cpu_usage_pct) = detect::collect_metrics();
+        let cached_models = detect::scan_cached_models();
         let req = HeartbeatRequest {
             vram_used_mb: None,
             ram_used_mb,
             cpu_usage_pct,
             gpu_temp_c: None,
             tokens_per_sec: None,
+            cached_models,
         };
 
         match client.post(&heartbeat_url).json(&req).send().await {

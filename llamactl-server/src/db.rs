@@ -20,6 +20,12 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool> {
     sqlx::query(include_str!("../migrations/002_deployments.sql"))
         .execute(&pool)
         .await?;
+    sqlx::query(include_str!("../migrations/003_cached_models.sql"))
+        .execute(&pool)
+        .await?;
+    sqlx::query(include_str!("../migrations/004_split_deployments.sql"))
+        .execute(&pool)
+        .await?;
 
     Ok(pool)
 }

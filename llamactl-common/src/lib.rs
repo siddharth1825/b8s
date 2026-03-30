@@ -70,6 +70,9 @@ pub struct HeartbeatRequest {
     pub cpu_usage_pct: f32,
     pub gpu_temp_c: Option<f32>,
     pub tokens_per_sec: Option<f32>,
+    /// Models already cached on this node (paths or HF repo IDs)
+    #[serde(default)]
+    pub cached_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,12 +104,21 @@ impl std::fmt::Display for DeploymentStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentRole {
+    /// Runs the full inference server (llama-server / mlx_lm.server)
+    Main,
+    /// Runs llama.cpp rpc-server to provide compute layers to the main node
+    RpcWorker,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeployRequest {
     /// Model identifier — HuggingFace repo or local path
     /// e.g. "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF" or "/path/to/model.gguf"
     pub model: String,
-    /// Optional: pin to a specific node by ID
+    /// Optional: pin to a specific node by ID (for single-node deploy)
     pub node_id: Option<Uuid>,
     /// Context length (default: 2048)
     pub context_length: Option<u32>,
@@ -114,6 +126,10 @@ pub struct DeployRequest {
     pub gpu_layers: Option<u32>,
     /// Port for the inference server on the worker (default: 8080)
     pub port: Option<u16>,
+    /// Split across multiple nodes (llama.cpp RPC tensor splitting)
+    /// If set, first node is main, rest are RPC workers
+    #[serde(default)]
+    pub split_nodes: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +163,16 @@ pub struct NodeAssignment {
     pub port: u16,
     pub context_length: u32,
     pub gpu_layers: u32,
+    /// Role this node plays in the deployment
+    #[serde(default = "default_role")]
+    pub role: AssignmentRole,
+    /// For main nodes in a split deployment: list of "host:port" for RPC workers
+    #[serde(default)]
+    pub rpc_servers: Vec<String>,
+}
+
+fn default_role() -> AssignmentRole {
+    AssignmentRole::Main
 }
 
 /// Agent reports back deployment status
@@ -177,4 +203,6 @@ pub struct NodeInfo {
     pub tokens_per_sec: Option<f32>,
     pub registered_at: DateTime<Utc>,
     pub last_heartbeat: DateTime<Utc>,
+    #[serde(default)]
+    pub cached_models: Vec<String>,
 }

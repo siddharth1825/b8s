@@ -1,4 +1,5 @@
 mod db;
+mod proxy;
 mod routes;
 
 use axum::{routing::{delete, get, post, put}, Router};
@@ -25,6 +26,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/deployments", get(routes::list_deployments).post(routes::create_deployment))
         .route("/api/deployments/{id}/status", put(routes::update_deployment_status))
         .route("/api/deployments/{id}", delete(routes::delete_deployment))
+        // OpenAI-compatible inference proxy
+        .route("/v1/models", get(proxy::list_models))
+        .route("/v1/chat/completions", post(proxy::proxy_inference))
+        .route("/v1/completions", post(proxy::proxy_inference))
+        .route("/v1/embeddings", post(proxy::proxy_inference))
         .layer(TraceLayer::new_for_http())
         .with_state(pool);
 

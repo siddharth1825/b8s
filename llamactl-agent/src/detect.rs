@@ -71,3 +71,41 @@ pub fn collect_metrics() -> (u64, f32) {
     let cpu_usage = sys.global_cpu_usage();
     (ram_used_mb, cpu_usage)
 }
+
+/// Scan for cached models in standard locations:
+/// - HuggingFace hub cache (~/.cache/huggingface/hub/)
+/// - MLX cache (~/.cache/huggingface/hub/ with mlx in the name)
+pub fn scan_cached_models() -> Vec<String> {
+    let mut models = Vec::new();
+
+    // HuggingFace cache: ~/.cache/huggingface/hub/models--<org>--<name>/
+    if let Some(home) = dirs_hint() {
+        let hf_hub = home.join(".cache/huggingface/hub");
+        if hf_hub.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&hf_hub) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("models--") {
+                        // Convert "models--org--name" -> "org/name"
+                        let model_id = name
+                            .strip_prefix("models--")
+                            .unwrap()
+                            .replacen("--", "/", 1);
+                        models.push(model_id);
+                    }
+                }
+            }
+        }
+    }
+
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn dirs_hint() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+}

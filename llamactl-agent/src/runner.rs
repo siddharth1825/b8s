@@ -114,25 +114,64 @@ impl Runner {
     }
 
     async fn start_inference(&self, assignment: &NodeAssignment) -> Result<Child> {
-        match self.backend {
-            BackendKind::Mlx => self.start_mlx(assignment).await,
-            BackendKind::LlamaCppRpc | BackendKind::Cpu => self.start_llama_cpp(assignment).await,
+        match assignment.role {
+            AssignmentRole::RpcWorker => self.start_rpc_worker(assignment).await,
+            AssignmentRole::Main => match self.backend {
+                BackendKind::Mlx => self.start_mlx(assignment).await,
+                BackendKind::LlamaCppRpc | BackendKind::Cpu => {
+                    self.start_llama_cpp(assignment).await
+                }
+            },
         }
     }
 
     async fn start_llama_cpp(&self, a: &NodeAssignment) -> Result<Child> {
-        // Try common binary names
         let bin = find_binary(&["llama-server", "llama.cpp/build/bin/llama-server"])
             .ok_or_else(|| anyhow::anyhow!(
                 "llama-server not found in PATH. Install llama.cpp and ensure llama-server is on your PATH."
             ))?;
 
-        let child = Command::new(bin)
-            .arg("-m").arg(&a.model)
+        let mut cmd = Command::new(bin);
+        cmd.arg("-m").arg(&a.model)
             .arg("--port").arg(a.port.to_string())
             .arg("-c").arg(a.context_length.to_string())
             .arg("-ngl").arg(a.gpu_layers.to_string())
+            .arg("--host").arg("0.0.0.0");
+
+        // If this is a split deployment, pass RPC servers for tensor splitting
+        if !a.rpc_servers.is_empty() {
+            let rpc_list = a.rpc_servers.join(",");
+            cmd.arg("--rpc").arg(&rpc_list);
+            tracing::info!(
+                rpc_servers = %rpc_list,
+                "Starting llama-server with RPC tensor splitting"
+            );
+        }
+
+        let child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+
+        Ok(child)
+    }
+
+    /// Start llama.cpp rpc-server — provides compute to a remote main node
+    async fn start_rpc_worker(&self, a: &NodeAssignment) -> Result<Child> {
+        let bin = find_binary(&["rpc-server", "llama.cpp/build/bin/rpc-server"])
+            .ok_or_else(|| anyhow::anyhow!(
+                "rpc-server not found in PATH. Build llama.cpp with RPC support (cmake -DGGML_RPC=ON)."
+            ))?;
+
+        tracing::info!(
+            port = a.port,
+            "Starting llama.cpp RPC worker"
+        );
+
+        let child = Command::new(bin)
             .arg("--host").arg("0.0.0.0")
+            .arg("--port").arg(a.port.to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -142,7 +181,6 @@ impl Runner {
     }
 
     async fn start_mlx(&self, a: &NodeAssignment) -> Result<Child> {
-        // mlx_lm.server is a Python module: python3 -m mlx_lm.server --model <hf_repo> --port <port>
         let child = Command::new("python3")
             .arg("-m").arg("mlx_lm.server")
             .arg("--model").arg(&a.model)

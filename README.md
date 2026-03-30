@@ -81,6 +81,39 @@ The agent on the target node will automatically start the appropriate inference 
 - **Apple Silicon nodes**: `mlx_lm.server` (requires `pip install mlx-lm`)
 - **CUDA/CPU nodes**: `llama-server` (requires [llama.cpp](https://github.com/ggerganov/llama.cpp) built and on PATH)
 
+### Split a model across multiple nodes
+
+The killer feature — run a model too large for one machine by splitting layers across nodes via llama.cpp RPC:
+
+```bash
+# Get your node IDs
+./target/release/llamactl get nodes
+
+# Split across two nodes: first is main (runs llama-server), rest are RPC workers
+./target/release/llamactl deploy model.gguf --split <mac-node-id>,<windows-node-id>
+```
+
+This starts `rpc-server` on the worker nodes and `llama-server --rpc <worker1>:50053,...` on the main node. The model's layers are distributed across all GPUs transparently.
+
+Requirements: `llama-server` and `rpc-server` on PATH (build llama.cpp with `-DGGML_RPC=ON`).
+
+### Unified inference endpoint
+
+The server proxies OpenAI-compatible requests to the right node automatically:
+
+```bash
+# Point any client at the server — no need to know which node has the model
+curl http://localhost:6969/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit", "messages": [{"role": "user", "content": "hello"}]}'
+
+# Works with Open WebUI, LiteLLM, or any OpenAI-compatible client
+# Just set the base URL to http://<server-ip>:6969/v1
+
+# List available models
+curl http://localhost:6969/v1/models
+```
+
 ### Query the cluster
 
 ```bash
@@ -108,7 +141,7 @@ ID                                    MODEL                           NODE      
 ./target/release/llamactl top
 ```
 
-Refreshes every 2 seconds with color-coded status. Ctrl+C to exit.
+Full ratatui TUI with color-coded status, CPU bars, cached model counts. Press `q` to exit.
 
 ### Stop a deployment
 
@@ -135,14 +168,17 @@ llamactl/
 │   └── src/
 │       ├── main.rs      # Axum server setup
 │       ├── db.rs        # Database init
-│       └── routes.rs    # API endpoints
+│       ├── routes.rs    # API endpoints
+│       └── proxy.rs     # OpenAI-compatible inference proxy
 ├── llamactl-agent/      # Worker agent
 │   └── src/
 │       ├── main.rs      # Registration + heartbeat loop
 │       ├── detect.rs    # Hardware/backend auto-detection
 │       └── runner.rs    # Inference process lifecycle management
 └── llamactl-cli/        # CLI
-    └── src/main.rs      # deploy, get nodes/deployments, stop, top
+    └── src/
+        ├── main.rs      # deploy, get nodes/deployments, stop, top
+        └── tui.rs        # Ratatui live dashboard
 ```
 
 ## Roadmap
@@ -153,12 +189,14 @@ llamactl/
 - [x] `llamactl stop` — stop deployments
 - [x] Auto-scheduling (picks node with most free memory)
 - [x] llama.cpp + MLX process management
+- [x] Unified OpenAI-compatible proxy (`/v1/chat/completions`)
+- [x] Ratatui-based live TUI for `top`
+- [x] Model registry — tracks cached models per node, prefers cache-hit scheduling
+- [x] Multi-node split inference (llama.cpp RPC tensor splitting)
 - [ ] `llamactl logs <deployment>` — stream logs from workers
 - [ ] WebSocket live streaming for metrics
 - [ ] GPU temperature + VRAM usage from inference runtimes
-- [ ] Ratatui-based full TUI for `top`
 - [ ] Model download progress tracking
-- [ ] Multi-node split inference (llama.cpp RPC tensor splitting)
 - [ ] gRPC transport (tonic) for agent ↔ server
 
 ## License
