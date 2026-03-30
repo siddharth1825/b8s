@@ -1,0 +1,21 @@
+[package]
+name = "llamactl-agent"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "llamactl-agent"
+path = "src/main.rs"
+
+[dependencies]
+llamactl-common = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+sysinfo = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
