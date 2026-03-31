@@ -38,10 +38,30 @@ pub fn detect_hardware() -> HardwareInfo {
 }
 
 fn detect_backend() -> (BackendKind, Option<u64>) {
+    // Allow manual override: LLAMACTL_BACKEND=llama_cpp_rpc|mlx|cpu
+    if let Ok(override_val) = std::env::var("LLAMACTL_BACKEND") {
+        let backend = match override_val.to_lowercase().as_str() {
+            "llama_cpp_rpc" | "llamacpp" | "llama" => BackendKind::LlamaCppRpc,
+            "mlx" => BackendKind::Mlx,
+            "cpu" => BackendKind::Cpu,
+            other => {
+                tracing::warn!(
+                    value = other,
+                    "Unknown LLAMACTL_BACKEND value, falling back to auto-detect"
+                );
+                return auto_detect_backend();
+            }
+        };
+        let vram = detect_vram(&backend);
+        return (backend, vram);
+    }
+
+    auto_detect_backend()
+}
+
+fn auto_detect_backend() -> (BackendKind, Option<u64>) {
     // Check for Apple Silicon (Metal)
     if cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64" {
-        // On Apple Silicon, unified memory acts as VRAM
-        // Report total system memory as available VRAM since it's unified
         let sys = System::new_all();
         let total_mb = sys.total_memory() / (1024 * 1024);
         return (BackendKind::Mlx, Some(total_mb));
@@ -63,6 +83,38 @@ fn detect_backend() -> (BackendKind, Option<u64>) {
     }
 
     (BackendKind::Cpu, None)
+}
+
+fn detect_vram(backend: &BackendKind) -> Option<u64> {
+    match backend {
+        BackendKind::Mlx => {
+            let sys = System::new_all();
+            Some(sys.total_memory() / (1024 * 1024))
+        }
+        BackendKind::LlamaCppRpc => {
+            // Try nvidia-smi, fall back to unified memory on Mac
+            if let Ok(output) = std::process::Command::new("nvidia-smi")
+                .arg("--query-gpu=memory.total")
+                .arg("--format=csv,noheader,nounits")
+                .output()
+            {
+                if output.status.success() {
+                    if let Ok(s) = String::from_utf8(output.stdout) {
+                        if let Ok(vram) = s.trim().parse::<u64>() {
+                            return Some(vram);
+                        }
+                    }
+                }
+            }
+            // Apple Silicon with llama.cpp — unified memory is VRAM
+            if cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64" {
+                let sys = System::new_all();
+                return Some(sys.total_memory() / (1024 * 1024));
+            }
+            None
+        }
+        BackendKind::Cpu => None,
+    }
 }
 
 pub fn collect_metrics() -> (u64, f32) {

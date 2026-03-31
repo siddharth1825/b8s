@@ -55,17 +55,37 @@ impl Runner {
                 if let Some(child) = self.running.get_mut(&assignment.deployment_id) {
                     match child.try_wait() {
                         Ok(Some(exit)) => {
+                            // Capture stderr for error reporting
+                            let stderr_output = if let Some(stderr) = child.stderr.take() {
+                                use tokio::io::AsyncReadExt;
+                                let mut buf = Vec::new();
+                                let mut reader = stderr;
+                                let _ = reader.read_to_end(&mut buf).await;
+                                let s = String::from_utf8_lossy(&buf);
+                                // Take last 500 chars to avoid huge error messages
+                                let s = if s.len() > 500 { &s[s.len()-500..] } else { &s };
+                                s.to_string()
+                            } else {
+                                String::new()
+                            };
+
                             tracing::warn!(
                                 deployment_id = %assignment.deployment_id,
                                 exit_code = ?exit.code(),
+                                stderr = %stderr_output,
                                 "Inference process exited unexpectedly"
                             );
                             self.running.remove(&assignment.deployment_id);
+                            let error_msg = if stderr_output.is_empty() {
+                                format!("Process exited with code {:?}", exit.code())
+                            } else {
+                                format!("Exit code {:?}: {}", exit.code(), stderr_output.trim())
+                            };
                             self.report_status(
                                 assignment.deployment_id,
                                 DeploymentStatus::Failed,
                                 None,
-                                Some(format!("Process exited with code {:?}", exit.code())),
+                                Some(error_msg),
                             ).await;
                         }
                         Ok(None) => {} // still running, all good
