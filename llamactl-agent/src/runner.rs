@@ -169,8 +169,8 @@ impl Runner {
         }
 
         let child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()?;
 
@@ -192,8 +192,8 @@ impl Runner {
         let child = Command::new(bin)
             .arg("--host").arg("0.0.0.0")
             .arg("--port").arg(a.port.to_string())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()?;
 
@@ -205,8 +205,8 @@ impl Runner {
             .arg("-m").arg("mlx_lm.server")
             .arg("--model").arg(&a.model)
             .arg("--port").arg(a.port.to_string())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()?;
 
