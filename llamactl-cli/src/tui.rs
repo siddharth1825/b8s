@@ -430,7 +430,7 @@ fn draw_nodes_panel(frame: &mut Frame, area: Rect, app: &App) {
     let border_color = if is_active { Color::Cyan } else { Color::DarkGray };
 
     let header = Row::new(vec![
-        "HOSTNAME", "STATUS", "BACKEND", "VRAM", "RAM", "CPU", "CACHED",
+        "ID", "HOSTNAME", "STATUS", "BACKEND", "VRAM", "RAM", "CPU", "CACHED",
     ])
     .style(Style::default().fg(Color::Cyan).bold());
 
@@ -471,6 +471,7 @@ fn draw_nodes_panel(frame: &mut Frame, area: Rect, app: &App) {
             };
 
             Row::new(vec![
+                Cell::from(n.id.to_string()),
                 Cell::from(short_hostname(&n.hostname)),
                 Cell::from(n.status.to_string()).style(status_style),
                 Cell::from(n.backend.to_string()),
@@ -486,7 +487,8 @@ fn draw_nodes_panel(frame: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(18),
+            Constraint::Length(36),
+            Constraint::Length(16),
             Constraint::Length(10),
             Constraint::Length(14),
             Constraint::Length(14),
@@ -514,7 +516,7 @@ fn draw_deployments_panel(frame: &mut Frame, area: Rect, app: &App) {
     let is_active = app.panel == Panel::Deployments;
     let border_color = if is_active { Color::Cyan } else { Color::DarkGray };
 
-    let header = Row::new(vec!["MODEL", "NODE", "STATUS", "PORT", "ENDPOINT"])
+    let header = Row::new(vec!["ID", "MODEL", "NODE", "STATUS", "PORT", "ENDPOINT"])
         .style(Style::default().fg(Color::Cyan).bold());
 
     let rows: Vec<Row> = app
@@ -541,6 +543,7 @@ fn draw_deployments_panel(frame: &mut Frame, area: Rect, app: &App) {
             };
 
             Row::new(vec![
+                Cell::from(d.id.to_string()),
                 Cell::from(model),
                 Cell::from(short_hostname(&d.node_hostname)),
                 Cell::from(d.status.to_string()).style(status_style),
@@ -554,8 +557,9 @@ fn draw_deployments_panel(frame: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(32),
-            Constraint::Length(18),
+            Constraint::Length(36),
+            Constraint::Length(28),
+            Constraint::Length(16),
             Constraint::Length(12),
             Constraint::Length(6),
             Constraint::Min(20),
