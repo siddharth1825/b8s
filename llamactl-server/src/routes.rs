@@ -12,11 +12,11 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 const HEARTBEAT_TIMEOUT_SECS: i64 = 30;
 
 /// POST /api/nodes/register
+/// If a node with the same hostname already exists, reuse it (re-registration).
 pub async fn register_node(
     State(pool): State<SqlitePool>,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>, StatusCode> {
-    let node_id = Uuid::new_v4();
     let now = Utc::now().to_rfc3339();
     let backend_str = serde_json::to_value(&req.backend)
         .unwrap()
@@ -24,38 +24,133 @@ pub async fn register_node(
         .unwrap()
         .to_string();
 
-    sqlx::query(
-        "INSERT INTO nodes (id, hostname, os, arch, backend, status, vram_mb, total_ram_mb, cpu_cores, registered_at, last_heartbeat)
-         VALUES (?, ?, ?, ?, ?, 'online', ?, ?, ?, ?, ?)"
+    // Check if node with same hostname already exists
+    let existing = sqlx::query_as::<_, NodeRow>(
+        "SELECT * FROM nodes WHERE hostname = ?"
     )
-    .bind(node_id.to_string())
     .bind(&req.hostname)
-    .bind(&req.os)
-    .bind(&req.arch)
-    .bind(&backend_str)
-    .bind(req.vram_mb.map(|v| v as i64))
-    .bind(req.total_ram_mb as i64)
-    .bind(req.cpu_cores as i32)
-    .bind(&now)
-    .bind(&now)
-    .execute(&pool)
+    .fetch_optional(&pool)
     .await
     .map_err(|e| {
-        tracing::error!("Failed to register node: {e}");
+        tracing::error!("Failed to check existing node: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    tracing::info!(
-        node_id = %node_id,
-        hostname = %req.hostname,
-        backend = %req.backend,
-        "Node registered"
-    );
+    let node_id = if let Some(existing) = existing {
+        // Re-register: update existing node, bring it back online
+        let id = existing.id.clone();
+        sqlx::query(
+            "UPDATE nodes SET os = ?, arch = ?, backend = ?, status = 'online',
+             vram_mb = ?, total_ram_mb = ?, cpu_cores = ?, last_heartbeat = ?
+             WHERE id = ?"
+        )
+        .bind(&req.os)
+        .bind(&req.arch)
+        .bind(&backend_str)
+        .bind(req.vram_mb.map(|v| v as i64))
+        .bind(req.total_ram_mb as i64)
+        .bind(req.cpu_cores as i32)
+        .bind(&now)
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to update node: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let uuid = Uuid::parse_str(&id).unwrap();
+        tracing::info!(
+            node_id = %uuid,
+            hostname = %req.hostname,
+            backend = %req.backend,
+            "Node re-registered (existing)"
+        );
+        uuid
+    } else {
+        // New node
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO nodes (id, hostname, os, arch, backend, status, vram_mb, total_ram_mb, cpu_cores, registered_at, last_heartbeat)
+             VALUES (?, ?, ?, ?, ?, 'online', ?, ?, ?, ?, ?)"
+        )
+        .bind(id.to_string())
+        .bind(&req.hostname)
+        .bind(&req.os)
+        .bind(&req.arch)
+        .bind(&backend_str)
+        .bind(req.vram_mb.map(|v| v as i64))
+        .bind(req.total_ram_mb as i64)
+        .bind(req.cpu_cores as i32)
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to register node: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        tracing::info!(
+            node_id = %id,
+            hostname = %req.hostname,
+            backend = %req.backend,
+            "Node registered (new)"
+        );
+        id
+    };
 
     Ok(Json(RegisterResponse {
         node_id,
         heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS,
     }))
+}
+
+/// DELETE /api/nodes/:id — remove a stale node
+pub async fn delete_node(
+    State(pool): State<SqlitePool>,
+    Path(node_id): Path<Uuid>,
+) -> Result<Json<HeartbeatResponse>, StatusCode> {
+    let id_str = node_id.to_string();
+
+    // Stop any active deployments on this node
+    sqlx::query("UPDATE deployments SET status = 'stopped' WHERE node_id = ? AND status IN ('pending', 'running', 'downloading')")
+        .bind(&id_str)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to stop deployments: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Clean up cached models
+    let _ = sqlx::query("DELETE FROM cached_models WHERE node_id = ?")
+        .bind(&id_str)
+        .execute(&pool)
+        .await;
+
+    // Clean up deployment workers
+    let _ = sqlx::query("DELETE FROM deployment_workers WHERE node_id = ?")
+        .bind(&id_str)
+        .execute(&pool)
+        .await;
+
+    // Delete the node
+    let result = sqlx::query("DELETE FROM nodes WHERE id = ?")
+        .bind(&id_str)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to delete node: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if result.rows_affected() == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    tracing::info!(node_id = %node_id, "Node removed");
+    Ok(Json(HeartbeatResponse { ok: true }))
 }
 
 /// POST /api/nodes/:id/heartbeat
@@ -515,27 +610,79 @@ pub async fn update_deployment_status(
     Ok(Json(HeartbeatResponse { ok: true }))
 }
 
-/// DELETE /api/deployments/:id — stop a deployment
+/// DELETE /api/deployments/:id — fully remove a deployment from the DB
 pub async fn delete_deployment(
     State(pool): State<SqlitePool>,
     Path(deployment_id): Path<Uuid>,
 ) -> Result<Json<HeartbeatResponse>, StatusCode> {
-    let result = sqlx::query(
-        "UPDATE deployments SET status = 'stopped' WHERE id = ? AND status != 'stopped'"
-    )
-    .bind(deployment_id.to_string())
-    .execute(&pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to stop deployment: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let id_str = deployment_id.to_string();
+
+    // First stop it if running (agent will pick up the removal)
+    let _ = sqlx::query("UPDATE deployments SET status = 'stopped' WHERE id = ? AND status NOT IN ('stopped', 'failed')")
+        .bind(&id_str)
+        .execute(&pool)
+        .await;
+
+    // Clean up workers
+    let _ = sqlx::query("DELETE FROM deployment_workers WHERE deployment_id = ?")
+        .bind(&id_str)
+        .execute(&pool)
+        .await;
+
+    // Delete the deployment
+    let result = sqlx::query("DELETE FROM deployments WHERE id = ?")
+        .bind(&id_str)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to delete deployment: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     if result.rows_affected() == 0 {
         return Err(StatusCode::NOT_FOUND);
     }
 
-    tracing::info!(deployment_id = %deployment_id, "Deployment stopped");
+    tracing::info!(deployment_id = %deployment_id, "Deployment deleted");
+    Ok(Json(HeartbeatResponse { ok: true }))
+}
+
+/// PUT /api/deployments/:id — pause, resume, or restart a deployment
+pub async fn update_deployment_control(
+    State(pool): State<SqlitePool>,
+    Path(deployment_id): Path<Uuid>,
+    Json(req): Json<DeploymentControlRequest>,
+) -> Result<Json<HeartbeatResponse>, StatusCode> {
+    let id_str = deployment_id.to_string();
+
+    let new_status = match req.action {
+        DeploymentAction::Pause => "paused",
+        DeploymentAction::Resume => "pending",  // agent will pick it up again
+        DeploymentAction::Restart => {
+            // Stop first, then set to pending
+            let _ = sqlx::query("UPDATE deployments SET status = 'stopped' WHERE id = ?")
+                .bind(&id_str)
+                .execute(&pool)
+                .await;
+            "pending"
+        }
+    };
+
+    let result = sqlx::query("UPDATE deployments SET status = ?, error = NULL WHERE id = ?")
+        .bind(new_status)
+        .bind(&id_str)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to update deployment: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if result.rows_affected() == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    tracing::info!(deployment_id = %deployment_id, action = ?req.action, "Deployment control");
     Ok(Json(HeartbeatResponse { ok: true }))
 }
 

@@ -88,6 +88,7 @@ pub enum DeploymentStatus {
     Pending,
     Downloading,
     Running,
+    Paused,
     Stopped,
     Failed,
 }
@@ -98,6 +99,7 @@ impl std::fmt::Display for DeploymentStatus {
             Self::Pending => write!(f, "pending"),
             Self::Downloading => write!(f, "downloading"),
             Self::Running => write!(f, "running"),
+            Self::Paused => write!(f, "paused"),
             Self::Stopped => write!(f, "stopped"),
             Self::Failed => write!(f, "failed"),
         }
@@ -181,6 +183,20 @@ pub struct DeploymentStatusUpdate {
     pub status: DeploymentStatus,
     pub endpoint: Option<String>,
     pub error: Option<String>,
+}
+
+/// CLI/TUI sends control commands for deployments
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentAction {
+    Pause,
+    Resume,
+    Restart,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentControlRequest {
+    pub action: DeploymentAction,
 }
 
 // ── Node info (returned by GET /api/nodes) ──────────────────────

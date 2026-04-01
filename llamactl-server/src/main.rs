@@ -23,9 +23,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/nodes/{id}/heartbeat", post(routes::heartbeat))
         .route("/api/nodes", get(routes::list_nodes))
         .route("/api/nodes/{id}/assignments", get(routes::get_assignments))
+        .route("/api/nodes/{id}", delete(routes::delete_node))
         .route("/api/deployments", get(routes::list_deployments).post(routes::create_deployment))
         .route("/api/deployments/{id}/status", put(routes::update_deployment_status))
-        .route("/api/deployments/{id}", delete(routes::delete_deployment))
+        .route("/api/deployments/{id}", delete(routes::delete_deployment).put(routes::update_deployment_control))
+        // Health check
+        .route("/healthz", get(|| async { "ok" }))
         // OpenAI-compatible inference proxy
         .route("/v1/models", get(proxy::list_models))
         .route("/v1/chat/completions", post(proxy::proxy_inference))

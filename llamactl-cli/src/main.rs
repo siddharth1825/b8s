@@ -43,12 +43,27 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         split: Vec<uuid::Uuid>,
     },
-    /// Stop a running deployment
+    /// Stop and remove a deployment
     Stop {
         /// Deployment ID
         deployment_id: uuid::Uuid,
     },
-    /// Live cluster dashboard
+    /// Pause a running deployment (keeps it in the DB, stops the process)
+    Pause {
+        /// Deployment ID
+        deployment_id: uuid::Uuid,
+    },
+    /// Resume a paused deployment or restart a failed/stopped one
+    Resume {
+        /// Deployment ID
+        deployment_id: uuid::Uuid,
+    },
+    /// Remove a stale/offline node
+    RemoveNode {
+        /// Node ID
+        node_id: uuid::Uuid,
+    },
+    /// Live interactive cluster dashboard
     Top,
 }
 
@@ -63,6 +78,7 @@ enum GetResource {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let client = reqwest::Client::new();
 
     match cli.command {
         Commands::Get { resource } => match resource {
@@ -71,9 +87,52 @@ async fn main() -> Result<()> {
         },
         Commands::Deploy {
             model, node, port, context_length, gpu_layers, split,
-        } => deploy(&cli.server, model, node, port, context_length, gpu_layers, split).await?,
-        Commands::Stop { deployment_id } => stop(&cli.server, deployment_id).await?,
-        Commands::Top => top(&cli.server).await?,
+        } => deploy(&cli.server, &client, model, node, port, context_length, gpu_layers, split).await?,
+        Commands::Stop { deployment_id } => {
+            client
+                .delete(format!("{}/api/deployments/{deployment_id}", cli.server))
+                .send()
+                .await
+                .context("Failed to connect to server")?
+                .error_for_status()
+                .context("Deployment not found")?;
+            println!("Deployment {} deleted.", &deployment_id.to_string()[..8]);
+        }
+        Commands::Pause { deployment_id } => {
+            let req = DeploymentControlRequest { action: DeploymentAction::Pause };
+            client
+                .put(format!("{}/api/deployments/{deployment_id}", cli.server))
+                .json(&req)
+                .send()
+                .await
+                .context("Failed to connect to server")?
+                .error_for_status()
+                .context("Failed to pause")?;
+            println!("Deployment {} paused.", &deployment_id.to_string()[..8]);
+        }
+        Commands::Resume { deployment_id } => {
+            let req = DeploymentControlRequest { action: DeploymentAction::Resume };
+            client
+                .put(format!("{}/api/deployments/{deployment_id}", cli.server))
+                .json(&req)
+                .send()
+                .await
+                .context("Failed to connect to server")?
+                .error_for_status()
+                .context("Failed to resume")?;
+            println!("Deployment {} resumed.", &deployment_id.to_string()[..8]);
+        }
+        Commands::RemoveNode { node_id } => {
+            client
+                .delete(format!("{}/api/nodes/{node_id}", cli.server))
+                .send()
+                .await
+                .context("Failed to connect to server")?
+                .error_for_status()
+                .context("Node not found")?;
+            println!("Node {} removed.", &node_id.to_string()[..8]);
+        }
+        Commands::Top => tui::run(&cli.server).await?,
     }
 
     Ok(())
@@ -93,20 +152,24 @@ async fn get_nodes(server: &str) -> Result<()> {
     }
 
     println!(
-        "{:<36}  {:<15}  {:<8}  {:<14}  {:<12}  {:<14}  {:<6}  {:<6}",
+        "{:<10}  {:<18}  {:<8}  {:<14}  {:<12}  {:<14}  {:<6}  {:<6}",
         "ID", "HOSTNAME", "STATUS", "BACKEND", "VRAM", "RAM", "CORES", "CPU%"
     );
 
     for node in &nodes {
         let vram = match (node.vram_used_mb, node.vram_mb) {
             (Some(used), Some(total)) => format!("{}/{} MB", used, total),
-            (None, Some(total)) => format!("-/{} MB", total),
+            (None, Some(total)) => format!("{} MB", total),
             _ => "-".to_string(),
         };
 
+        let hostname = node.hostname
+            .strip_suffix(".local").or_else(|| node.hostname.strip_suffix(".lan"))
+            .unwrap_or(&node.hostname);
+
         println!(
-            "{:<36}  {:<15}  {:<8}  {:<14}  {:<12}  {}/{} MB  {:<6}  {:.1}",
-            node.id, node.hostname, node.status, node.backend,
+            "{:<10}  {:<18}  {:<8}  {:<14}  {:<12}  {}/{} MB  {:<6}  {:.1}",
+            &node.id.to_string()[..8], hostname, node.status, node.backend,
             vram, node.ram_used_mb, node.total_ram_mb,
             node.cpu_cores, node.cpu_usage_pct,
         );
@@ -130,20 +193,25 @@ async fn get_deployments(server: &str) -> Result<()> {
     }
 
     println!(
-        "{:<36}  {:<30}  {:<15}  {:<10}  {:<6}  {}",
+        "{:<10}  {:<30}  {:<18}  {:<10}  {:<6}  {}",
         "ID", "MODEL", "NODE", "STATUS", "PORT", "ENDPOINT"
     );
 
     for d in &deployments {
-        let model_short = if d.model.len() > 28 {
-            format!("..{}", &d.model[d.model.len()-26..])
+        let model_name = d.model.rsplit('/').next().unwrap_or(&d.model);
+        let model_short = if model_name.len() > 28 {
+            format!("{}...", &model_name[..25])
         } else {
-            d.model.clone()
+            model_name.to_string()
         };
 
+        let hostname = d.node_hostname
+            .strip_suffix(".local").or_else(|| d.node_hostname.strip_suffix(".lan"))
+            .unwrap_or(&d.node_hostname);
+
         println!(
-            "{:<36}  {:<30}  {:<15}  {:<10}  {:<6}  {}",
-            d.id, model_short, d.node_hostname, d.status, d.port,
+            "{:<10}  {:<30}  {:<18}  {:<10}  {:<6}  {}",
+            &d.id.to_string()[..8], model_short, hostname, d.status, d.port,
             d.endpoint.as_deref().unwrap_or("-"),
         );
     }
@@ -154,6 +222,7 @@ async fn get_deployments(server: &str) -> Result<()> {
 
 async fn deploy(
     server: &str,
+    client: &reqwest::Client,
     model: String,
     node: Option<uuid::Uuid>,
     port: u16,
@@ -162,7 +231,7 @@ async fn deploy(
     split: Vec<uuid::Uuid>,
 ) -> Result<()> {
     let node_id = if !split.is_empty() {
-        Some(split[0]) // Main node is first in split list
+        Some(split[0])
     } else {
         node
     };
@@ -176,7 +245,7 @@ async fn deploy(
         split_nodes: split.clone(),
     };
 
-    let resp: DeployResponse = reqwest::Client::new()
+    let resp: DeployResponse = client
         .post(format!("{server}/api/deployments"))
         .json(&req)
         .send()
@@ -188,35 +257,18 @@ async fn deploy(
         .await?;
 
     println!("Deployment created:");
-    println!("  ID:     {}", resp.deployment_id);
-    println!("  Node:   {} ({})", resp.node_hostname, resp.node_id);
+    println!("  ID:     {}", &resp.deployment_id.to_string()[..8]);
+    println!("  Node:   {} ({})", resp.node_hostname, &resp.node_id.to_string()[..8]);
     println!("  Status: {}", resp.status);
     if split.len() > 1 {
         println!("  Mode:   split across {} nodes (llama.cpp RPC)", split.len());
-        println!("          main: {}", split[0]);
+        println!("          main: {}", &split[0].to_string()[..8]);
         for (i, worker) in split.iter().skip(1).enumerate() {
-            println!("          rpc-worker-{}: {}", i + 1, worker);
+            println!("          rpc-worker-{}: {}", i + 1, &worker.to_string()[..8]);
         }
     }
     println!("\nAgents will pick this up within ~10 seconds.");
-    println!("Check status: llamactl get deployments");
+    println!("Monitor: llamactl top");
 
     Ok(())
-}
-
-async fn stop(server: &str, deployment_id: uuid::Uuid) -> Result<()> {
-    reqwest::Client::new()
-        .delete(format!("{server}/api/deployments/{deployment_id}"))
-        .send()
-        .await
-        .context("Failed to connect to server")?
-        .error_for_status()
-        .context("Failed to stop deployment")?;
-
-    println!("Deployment {} stopped.", deployment_id);
-    Ok(())
-}
-
-async fn top(server: &str) -> Result<()> {
-    tui::run(server).await
 }
