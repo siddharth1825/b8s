@@ -14,7 +14,14 @@ pub struct HardwareInfo {
 pub fn detect_hardware() -> HardwareInfo {
     let sys = System::new_all();
 
-    let hostname = System::host_name().unwrap_or_else(|| "unknown".into());
+    // Use LAN IP as hostname for RPC connectivity (mDNS often broken)
+    // Override with LLAMACTL_HOSTNAME if needed
+    let hostname = std::env::var("LLAMACTL_HOSTNAME").unwrap_or_else(|_| {
+        detect_lan_ip().unwrap_or_else(|| {
+            System::host_name().unwrap_or_else(|| "unknown".into())
+        })
+    });
+
     let os = format!(
         "{} {}",
         System::name().unwrap_or_else(|| "unknown".into()),
@@ -35,6 +42,15 @@ pub fn detect_hardware() -> HardwareInfo {
         total_ram_mb,
         cpu_cores,
     }
+}
+
+/// Detect the primary LAN IP by opening a UDP socket to a public address.
+/// No traffic is actually sent — this just lets the OS pick the right interface.
+fn detect_lan_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let addr = socket.local_addr().ok()?;
+    Some(addr.ip().to_string())
 }
 
 fn detect_backend() -> (BackendKind, Option<u64>) {
