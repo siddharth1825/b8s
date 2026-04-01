@@ -86,7 +86,10 @@ pub struct HeartbeatResponse {
 #[serde(rename_all = "snake_case")]
 pub enum DeploymentStatus {
     Pending,
-    Downloading,
+    Starting,
+    Loading,
+    Transferring,
+    WarmingUp,
     Running,
     Paused,
     Stopped,
@@ -97,7 +100,10 @@ impl std::fmt::Display for DeploymentStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Pending => write!(f, "pending"),
-            Self::Downloading => write!(f, "downloading"),
+            Self::Starting => write!(f, "starting"),
+            Self::Loading => write!(f, "loading"),
+            Self::Transferring => write!(f, "transferring"),
+            Self::WarmingUp => write!(f, "warming up"),
             Self::Running => write!(f, "running"),
             Self::Paused => write!(f, "paused"),
             Self::Stopped => write!(f, "stopped"),
@@ -155,6 +161,27 @@ pub struct DeploymentInfo {
     pub endpoint: Option<String>,
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// Progress percentage (0-100) during loading/transferring
+    #[serde(default)]
+    pub progress: f32,
+    /// Recent log lines from the inference process
+    #[serde(default)]
+    pub logs: Vec<String>,
+    /// Worker nodes in a split deployment
+    #[serde(default)]
+    pub workers: Vec<WorkerInfo>,
+    /// Inference stats from the last request
+    #[serde(default)]
+    pub last_tok_per_sec: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerInfo {
+    pub node_id: Uuid,
+    pub hostname: String,
+    pub role: AssignmentRole,
+    pub rpc_port: u16,
+    pub buffer_size_mb: Option<f32>,
 }
 
 /// Returned to agent when it polls for work
@@ -183,6 +210,15 @@ pub struct DeploymentStatusUpdate {
     pub status: DeploymentStatus,
     pub endpoint: Option<String>,
     pub error: Option<String>,
+    /// Progress percentage (0-100) during loading/transferring
+    #[serde(default)]
+    pub progress: f32,
+    /// Recent log lines from the inference process
+    #[serde(default)]
+    pub logs: Vec<String>,
+    /// Inference speed from the last request
+    #[serde(default)]
+    pub last_tok_per_sec: Option<f32>,
 }
 
 /// CLI/TUI sends control commands for deployments

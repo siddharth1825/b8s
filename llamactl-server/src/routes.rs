@@ -418,6 +418,27 @@ pub async fn list_deployments(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    // Fetch all deployment workers in one query
+    let all_workers = sqlx::query_as::<_, DeploymentWorkerRow>(
+        "SELECT dw.deployment_id, dw.node_id, dw.role, dw.rpc_port, n.hostname
+         FROM deployment_workers dw JOIN nodes n ON dw.node_id = n.id"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
+
+    let mut workers_map: std::collections::HashMap<String, Vec<WorkerInfo>> = std::collections::HashMap::new();
+    for w in all_workers {
+        let info = WorkerInfo {
+            node_id: Uuid::parse_str(&w.node_id).unwrap(),
+            hostname: w.hostname,
+            role: serde_json::from_value(serde_json::Value::String(w.role)).unwrap_or(AssignmentRole::Main),
+            rpc_port: w.rpc_port as u16,
+            buffer_size_mb: None,
+        };
+        workers_map.entry(w.deployment_id).or_default().push(info);
+    }
+
     let deployments = rows.into_iter().map(|r| {
         let node_id = Uuid::parse_str(&r.node_id).unwrap();
         let endpoint = if r.status == "running" {
@@ -425,6 +446,9 @@ pub async fn list_deployments(
         } else {
             r.endpoint
         };
+
+        let logs: Vec<String> = serde_json::from_str(&r.logs).unwrap_or_default();
+        let workers = workers_map.remove(&r.id).unwrap_or_default();
 
         DeploymentInfo {
             id: Uuid::parse_str(&r.id).unwrap(),
@@ -440,6 +464,10 @@ pub async fn list_deployments(
             created_at: chrono::DateTime::parse_from_rfc3339(&r.created_at)
                 .unwrap()
                 .with_timezone(&Utc),
+            progress: r.progress as f32,
+            logs,
+            workers,
+            last_tok_per_sec: r.last_tok_per_sec.map(|v| v as f32),
         }
     }).collect();
 
@@ -583,12 +611,17 @@ pub async fn update_deployment_status(
         .unwrap()
         .to_string();
 
+    let logs_json = serde_json::to_string(&req.logs).unwrap_or_else(|_| "[]".into());
+
     let result = sqlx::query(
-        "UPDATE deployments SET status = ?, endpoint = ?, error = ? WHERE id = ?"
+        "UPDATE deployments SET status = ?, endpoint = ?, error = ?, progress = ?, logs = ?, last_tok_per_sec = ? WHERE id = ?"
     )
     .bind(&status_str)
     .bind(&req.endpoint)
     .bind(&req.error)
+    .bind(req.progress)
+    .bind(&logs_json)
+    .bind(req.last_tok_per_sec)
     .bind(deployment_id.to_string())
     .execute(&pool)
     .await
@@ -600,12 +633,6 @@ pub async fn update_deployment_status(
     if result.rows_affected() == 0 {
         return Err(StatusCode::NOT_FOUND);
     }
-
-    tracing::info!(
-        deployment_id = %deployment_id,
-        status = %req.status,
-        "Deployment status updated"
-    );
 
     Ok(Json(HeartbeatResponse { ok: true }))
 }
@@ -721,6 +748,9 @@ struct DeploymentRow {
     error: Option<String>,
     created_at: String,
     node_hostname: String,
+    progress: f64,
+    logs: String,
+    last_tok_per_sec: Option<f64>,
 }
 
 #[derive(sqlx::FromRow)]

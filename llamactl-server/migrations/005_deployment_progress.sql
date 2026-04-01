@@ -1,0 +1,3 @@
+ALTER TABLE deployments ADD COLUMN progress REAL NOT NULL DEFAULT 0.0;
+ALTER TABLE deployments ADD COLUMN logs TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE deployments ADD COLUMN last_tok_per_sec REAL;

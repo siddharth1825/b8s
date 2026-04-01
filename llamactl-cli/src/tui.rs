@@ -526,8 +526,11 @@ fn draw_deployments_panel(frame: &mut Frame, area: Rect, app: &App) {
         .map(|(i, d)| {
             let status_style = match d.status {
                 DeploymentStatus::Running => Style::default().fg(Color::Green),
-                DeploymentStatus::Pending | DeploymentStatus::Downloading => {
+                DeploymentStatus::Pending | DeploymentStatus::Starting => {
                     Style::default().fg(Color::Yellow)
+                }
+                DeploymentStatus::Loading | DeploymentStatus::Transferring | DeploymentStatus::WarmingUp => {
+                    Style::default().fg(Color::Cyan)
                 }
                 DeploymentStatus::Paused => Style::default().fg(Color::Blue),
                 DeploymentStatus::Failed => Style::default().fg(Color::Red),
@@ -542,11 +545,33 @@ fn draw_deployments_panel(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default()
             };
 
+            // Rich status with progress
+            let status_display = match d.status {
+                DeploymentStatus::Loading | DeploymentStatus::Transferring | DeploymentStatus::WarmingUp | DeploymentStatus::Starting => {
+                    format!("{} {}%", d.status, d.progress as u32)
+                }
+                DeploymentStatus::Running => {
+                    if let Some(tps) = d.last_tok_per_sec {
+                        format!("running {:.0} t/s", tps)
+                    } else {
+                        "running".into()
+                    }
+                }
+                _ => d.status.to_string(),
+            };
+
+            // Show workers count for split deployments
+            let node_display = if d.workers.is_empty() {
+                short_hostname(&d.node_hostname)
+            } else {
+                format!("{} +{}", short_hostname(&d.node_hostname), d.workers.len() - 1)
+            };
+
             Row::new(vec![
                 Cell::from(d.id.to_string()),
                 Cell::from(model),
-                Cell::from(short_hostname(&d.node_hostname)),
-                Cell::from(d.status.to_string()).style(status_style),
+                Cell::from(node_display),
+                Cell::from(status_display).style(status_style),
                 Cell::from(d.port.to_string()),
                 Cell::from(d.endpoint.as_deref().unwrap_or("-").to_string()),
             ])
@@ -559,8 +584,8 @@ fn draw_deployments_panel(frame: &mut Frame, area: Rect, app: &App) {
         [
             Constraint::Length(36),
             Constraint::Length(28),
-            Constraint::Length(16),
-            Constraint::Length(12),
+            Constraint::Length(18),
+            Constraint::Length(18),
             Constraint::Length(6),
             Constraint::Min(20),
         ],
@@ -753,18 +778,33 @@ fn draw_deployment_detail(frame: &mut Frame, app: &App) {
     };
 
     let area = frame.area();
+    let has_workers = !dep.workers.is_empty();
+    let _has_logs = !dep.logs.is_empty();
+
+    let constraints = if has_workers {
+        vec![
+            Constraint::Length(12),                              // info + progress
+            Constraint::Length((dep.workers.len() as u16) + 4), // topology
+            Constraint::Min(6),                                 // logs
+            Constraint::Length(2),                               // footer
+        ]
+    } else {
+        vec![
+            Constraint::Length(12), // info + progress
+            Constraint::Min(6),    // logs
+            Constraint::Length(2), // footer
+        ]
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(14), // info
-            Constraint::Min(4),    // error/endpoint
-            Constraint::Length(2), // footer
-        ])
+        .constraints(constraints)
         .split(area);
 
     let status_color = match dep.status {
         DeploymentStatus::Running => Color::Green,
-        DeploymentStatus::Pending | DeploymentStatus::Downloading => Color::Yellow,
+        DeploymentStatus::Pending | DeploymentStatus::Starting => Color::Yellow,
+        DeploymentStatus::Loading | DeploymentStatus::Transferring | DeploymentStatus::WarmingUp => Color::Cyan,
         DeploymentStatus::Paused => Color::Blue,
         DeploymentStatus::Failed => Color::Red,
         DeploymentStatus::Stopped => Color::DarkGray,
@@ -772,44 +812,72 @@ fn draw_deployment_detail(frame: &mut Frame, app: &App) {
 
     let age = format_duration_since(dep.created_at);
 
-    let info_lines = vec![
+    // Status line with progress bar
+    let status_line = match dep.status {
+        DeploymentStatus::Loading | DeploymentStatus::Transferring | DeploymentStatus::WarmingUp | DeploymentStatus::Starting => {
+            let bar = make_progress_bar(dep.progress as f64, 100.0, 20);
+            vec![
+                Span::styled(dep.status.to_string(), Style::default().fg(status_color).bold()),
+                Span::raw("  "),
+                Span::styled(bar, Style::default().fg(Color::Cyan)),
+                Span::raw(format!(" {:.0}%", dep.progress)),
+            ]
+        }
+        DeploymentStatus::Running => {
+            let mut spans = vec![
+                Span::styled("running", Style::default().fg(Color::Green).bold()),
+            ];
+            if let Some(tps) = dep.last_tok_per_sec {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(format!("{:.1} tok/s", tps), Style::default().fg(Color::Yellow).bold()));
+            }
+            spans
+        }
+        _ => vec![Span::styled(dep.status.to_string(), Style::default().fg(status_color).bold())],
+    };
+
+    let model_short = short_model(&dep.model);
+    let mut info_lines = vec![
         Line::from(vec![
-            Span::styled(" Model:    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&dep.model, Style::default().bold()),
+            Span::styled(" Model:     ", Style::default().fg(Color::DarkGray)),
+            Span::styled(model_short, Style::default().bold()),
         ]),
         Line::from(vec![
-            Span::styled(" ID:       ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Full path: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&dep.model, Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled(" ID:        ", Style::default().fg(Color::DarkGray)),
             Span::raw(dep.id.to_string()),
         ]),
         Line::from(vec![
-            Span::styled(" Node:     ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{} ({})", dep.node_hostname, &dep.node_id.to_string()[..8])),
+            Span::styled(" Node:      ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{} ({})", short_hostname(&dep.node_hostname), &dep.node_id.to_string()[..8])),
+        ]),
+        Line::from(std::iter::once(Span::styled(" Status:    ", Style::default().fg(Color::DarkGray))).chain(status_line).collect::<Vec<_>>()),
+        Line::from(vec![
+            Span::styled(" Endpoint:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                dep.endpoint.as_deref().unwrap_or("-"),
+                if dep.endpoint.is_some() { Style::default().fg(Color::Green) } else { Style::default().fg(Color::DarkGray) },
+            ),
         ]),
         Line::from(vec![
-            Span::styled(" Status:   ", Style::default().fg(Color::DarkGray)),
-            Span::styled(dep.status.to_string(), Style::default().fg(status_color).bold()),
+            Span::styled(" Config:    ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("ctx={}, gpu_layers={}, port={}", dep.context_length, dep.gpu_layers, dep.port)),
         ]),
         Line::from(vec![
-            Span::styled(" Port:     ", Style::default().fg(Color::DarkGray)),
-            Span::raw(dep.port.to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled(" Context:  ", Style::default().fg(Color::DarkGray)),
-            Span::raw(dep.context_length.to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled(" GPU Layers:", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!(" {}", dep.gpu_layers)),
-        ]),
-        Line::from(vec![
-            Span::styled(" Endpoint: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(dep.endpoint.as_deref().unwrap_or("-")),
-        ]),
-        Line::from(vec![
-            Span::styled(" Created:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Created:   ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{age} ago")),
         ]),
     ];
+
+    if let Some(ref err) = dep.error {
+        info_lines.push(Line::from(vec![
+            Span::styled(" Error:     ", Style::default().fg(Color::Red)),
+            Span::styled(err.as_str(), Style::default().fg(Color::Red)),
+        ]));
+    }
 
     let info = Paragraph::new(info_lines).block(
         Block::default()
@@ -820,33 +888,88 @@ fn draw_deployment_detail(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(info, chunks[0]);
 
-    // Error section
-    let error_lines = if let Some(ref err) = dep.error {
-        err.lines()
-            .map(|l| {
-                Line::from(Span::styled(
-                    format!(" {l}"),
-                    Style::default().fg(Color::Red),
-                ))
-            })
-            .collect()
-    } else {
+    let mut next_chunk = 1;
+
+    // Topology section for split deployments
+    if has_workers {
+        let mut topo_lines: Vec<Line> = Vec::new();
+        for w in &dep.workers {
+            let role_icon = match w.role {
+                AssignmentRole::Main => "main",
+                AssignmentRole::RpcWorker => " rpc",
+            };
+            let role_color = match w.role {
+                AssignmentRole::Main => Color::Green,
+                AssignmentRole::RpcWorker => Color::Yellow,
+            };
+            let buf_info = w.buffer_size_mb
+                .map(|mb| format!(" ({:.0} MB)", mb))
+                .unwrap_or_default();
+
+            topo_lines.push(Line::from(vec![
+                Span::styled(format!("  [{role_icon}] "), Style::default().fg(role_color).bold()),
+                Span::raw(format!("{}", short_hostname(&w.hostname))),
+                Span::styled(format!(" :{}", w.rpc_port), Style::default().fg(Color::DarkGray)),
+                Span::styled(buf_info, Style::default().fg(Color::Cyan)),
+            ]));
+        }
+
+        let topo = Paragraph::new(topo_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(format!(" Split Topology ({} nodes) ", dep.workers.len()))
+                .title_style(Style::default().fg(Color::White).bold()),
+        );
+        frame.render_widget(topo, chunks[next_chunk]);
+        next_chunk += 1;
+    }
+
+    // Logs section
+    let log_lines: Vec<Line> = if dep.logs.is_empty() && dep.error.is_none() {
         vec![Line::from(Span::styled(
-            " No errors",
+            " Waiting for output...",
             Style::default().fg(Color::DarkGray),
         ))]
+    } else {
+        dep.logs
+            .iter()
+            .map(|l| {
+                let style = if l.contains("error") || l.contains("failed") || l.contains("ABORT") {
+                    Style::default().fg(Color::Red)
+                } else if l.contains("warning") || l.contains("WARNING") {
+                    Style::default().fg(Color::Yellow)
+                } else if l.contains("model loaded") || l.contains("server is listening") {
+                    Style::default().fg(Color::Green)
+                } else if l.contains("RPC") || l.contains("rpc") {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                Line::from(Span::styled(format!(" {l}"), style))
+            })
+            .collect()
     };
 
-    let error_widget = Paragraph::new(error_lines)
-        .wrap(Wrap { trim: false })
+    // Auto-scroll to bottom
+    let visible_height = chunks[next_chunk].height.saturating_sub(2) as usize;
+    let scroll = if log_lines.len() > visible_height {
+        (log_lines.len() - visible_height) as u16
+    } else {
+        0
+    };
+
+    let logs_widget = Paragraph::new(log_lines)
+        .scroll((scroll, 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray))
-                .title(" Error Log ")
+                .title(format!(" Logs ({}) ", dep.logs.len()))
                 .title_style(Style::default().fg(Color::White).bold()),
         );
-    frame.render_widget(error_widget, chunks[1]);
+    frame.render_widget(logs_widget, chunks[next_chunk]);
+    next_chunk += 1;
 
     // Footer
     let mut keys: Vec<(&str, &str)> = vec![("esc", "back")];
@@ -874,7 +997,7 @@ fn draw_deployment_detail(frame: &mut Frame, app: &App) {
             ]
         })
         .collect();
-    frame.render_widget(Paragraph::new(Line::from(spans)), chunks[2]);
+    frame.render_widget(Paragraph::new(Line::from(spans)), chunks[next_chunk]);
 }
 
 fn draw_help(frame: &mut Frame) {
@@ -939,6 +1062,13 @@ fn make_bar(value: f64, max: f64) -> String {
     let filled = filled.min(width);
     let empty = width - filled;
     format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+}
+
+fn make_progress_bar(value: f64, max: f64, width: usize) -> String {
+    let filled = ((value / max) * width as f64).round() as usize;
+    let filled = filled.min(width);
+    let empty = width - filled;
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
 }
 
 fn short_hostname(hostname: &str) -> String {
