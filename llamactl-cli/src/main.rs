@@ -152,7 +152,7 @@ async fn get_nodes(server: &str) -> Result<()> {
     }
 
     println!(
-        "{:<10}  {:<18}  {:<8}  {:<14}  {:<12}  {:<14}  {:<6}  {:<6}",
+        "{:<36}  {:<18}  {:<8}  {:<14}  {:<12}  {:<14}  {:<6}  {:<6}",
         "ID", "HOSTNAME", "STATUS", "BACKEND", "VRAM", "RAM", "CORES", "CPU%"
     );
 
@@ -168,8 +168,8 @@ async fn get_nodes(server: &str) -> Result<()> {
             .unwrap_or(&node.hostname);
 
         println!(
-            "{:<10}  {:<18}  {:<8}  {:<14}  {:<12}  {}/{} MB  {:<6}  {:.1}",
-            &node.id.to_string()[..8], hostname, node.status, node.backend,
+            "{:<36}  {:<18}  {:<8}  {:<14}  {:<12}  {}/{} MB  {:<6}  {:.1}",
+            node.id, hostname, node.status, node.backend,
             vram, node.ram_used_mb, node.total_ram_mb,
             node.cpu_cores, node.cpu_usage_pct,
         );
@@ -193,7 +193,7 @@ async fn get_deployments(server: &str) -> Result<()> {
     }
 
     println!(
-        "{:<10}  {:<30}  {:<18}  {:<10}  {:<6}  {}",
+        "{:<36}  {:<30}  {:<18}  {:<10}  {:<6}  {}",
         "ID", "MODEL", "NODE", "STATUS", "PORT", "ENDPOINT"
     );
 
@@ -210,8 +210,8 @@ async fn get_deployments(server: &str) -> Result<()> {
             .unwrap_or(&d.node_hostname);
 
         println!(
-            "{:<10}  {:<30}  {:<18}  {:<10}  {:<6}  {}",
-            &d.id.to_string()[..8], model_short, hostname, d.status, d.port,
+            "{:<36}  {:<30}  {:<18}  {:<10}  {:<6}  {}",
+            d.id, model_short, hostname, d.status, d.port,
             d.endpoint.as_deref().unwrap_or("-"),
         );
     }
