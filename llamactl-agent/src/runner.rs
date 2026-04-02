@@ -363,10 +363,12 @@ impl Runner {
             report_to_server(&self.client, &self.server_url, a.deployment_id, &s).await;
         }
 
-        // Each node runs: python3 -m mlx_lm.server --model <model> --port <port>
-        // with MLX_RANK and MLX_HOSTFILE set
-        let mut child = Command::new("python3")
-            .arg("-m").arg("mlx_lm.server")
+        let (mlx_cmd, mlx_args) = find_mlx_lm_server();
+        let mut cmd = Command::new(&mlx_cmd);
+        for arg in &mlx_args {
+            cmd.arg(arg);
+        }
+        let mut child = cmd
             .arg("--model").arg(&a.model)
             .arg("--port").arg(a.port.to_string())
             .env("MLX_RANK", a.mlx_rank.to_string())
@@ -404,8 +406,12 @@ impl Runner {
     }
 
     async fn start_mlx(&self, a: &NodeAssignment) -> Result<Child> {
-        let mut child = Command::new("python3")
-            .arg("-m").arg("mlx_lm.server")
+        let (mlx_cmd, mlx_args) = find_mlx_lm_server();
+        let mut cmd = Command::new(&mlx_cmd);
+        for arg in &mlx_args {
+            cmd.arg(arg);
+        }
+        let mut child = cmd
             .arg("--model").arg(&a.model)
             .arg("--port").arg(a.port.to_string())
             .stdout(Stdio::piped())
@@ -660,6 +666,26 @@ async fn parse_mlx_distributed_output(
             report_to_server(&client, &server_url, dep_id, &s).await;
         }
     }
+}
+
+/// Find mlx_lm.server — tries brew binary first, then python3 -m
+fn find_mlx_lm_server() -> (String, Vec<String>) {
+    // Brew installs to /opt/homebrew/opt/mlx-lm/bin/mlx_lm.server
+    let brew_paths = [
+        "/opt/homebrew/opt/mlx-lm/bin/mlx_lm.server",
+        "/usr/local/opt/mlx-lm/bin/mlx_lm.server",
+    ];
+    for path in &brew_paths {
+        if std::path::Path::new(path).exists() {
+            return (path.to_string(), vec![]);
+        }
+    }
+    // Try mlx_lm.server on PATH
+    if which::which("mlx_lm.server").is_ok() {
+        return ("mlx_lm.server".into(), vec![]);
+    }
+    // Fall back to python3 -m
+    ("python3".into(), vec!["-m".into(), "mlx_lm.server".into()])
 }
 
 fn find_binary(names: &[&str]) -> Option<String> {
