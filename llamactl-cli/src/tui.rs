@@ -897,10 +897,12 @@ fn draw_deployment_detail(frame: &mut Frame, app: &App) {
             let role_icon = match w.role {
                 AssignmentRole::Main => "main",
                 AssignmentRole::RpcWorker => " rpc",
+                AssignmentRole::MlxRingPeer => " mlx",
             };
             let role_color = match w.role {
                 AssignmentRole::Main => Color::Green,
                 AssignmentRole::RpcWorker => Color::Yellow,
+                AssignmentRole::MlxRingPeer => Color::Magenta,
             };
             let buf_info = w.buffer_size_mb
                 .map(|mb| format!(" ({:.0} MB)", mb))

@@ -155,6 +155,19 @@ impl Runner {
     }
 
     async fn start_inference(&self, assignment: &NodeAssignment) -> Result<Child> {
+        // MLX ring peers don't need to start anything — main handles everything via mlx.launch
+        if assignment.role == AssignmentRole::MlxRingPeer {
+            anyhow::bail!("MLX ring peers are launched by the main node via SSH");
+        }
+
+        // MLX ring main — use mlx.launch with hostfile
+        if assignment.role == AssignmentRole::Main
+            && assignment.split_backend == Some(SplitBackend::MlxRing)
+            && !assignment.mlx_peers.is_empty()
+        {
+            return self.start_mlx_distributed(assignment).await;
+        }
+
         match assignment.role {
             AssignmentRole::RpcWorker => self.start_rpc_worker(assignment).await,
             AssignmentRole::Main => match self.backend {
@@ -163,6 +176,7 @@ impl Runner {
                     self.start_llama_cpp(assignment).await
                 }
             },
+            AssignmentRole::MlxRingPeer => unreachable!(),
         }
     }
 
@@ -310,6 +324,78 @@ impl Runner {
             s.status = DeploymentStatus::Running;
             s.endpoint = Some(format!("rpc://0.0.0.0:{}", a.port));
             s.dirty = true;
+        }
+
+        Ok(child)
+    }
+
+    /// Start MLX Distributed ring — generates hostfile and uses mlx.launch
+    async fn start_mlx_distributed(&self, a: &NodeAssignment) -> Result<Child> {
+        tracing::info!(
+            peers = ?a.mlx_peers,
+            model = %a.model,
+            port = a.port,
+            "Starting MLX Distributed ring"
+        );
+
+        // Generate hostfile JSON
+        let hostfile: Vec<serde_json::Value> = a.mlx_peers.iter().map(|ip| {
+            serde_json::json!({
+                "ssh": ip,
+                "ips": [ip]
+            })
+        }).collect();
+
+        // Write hostfile to temp dir
+        let hostfile_path = std::env::temp_dir().join(format!("llamactl-mlx-hosts-{}.json", a.deployment_id));
+        std::fs::write(&hostfile_path, serde_json::to_string_pretty(&hostfile)?)?;
+
+        tracing::info!(hostfile = %hostfile_path.display(), "Generated MLX hostfile");
+
+        if let Some(state) = self.states.get(&a.deployment_id) {
+            let mut s = state.lock().await;
+            s.status = DeploymentStatus::Starting;
+            s.progress = 5.0;
+            push_log(&mut s.logs, &format!("MLX Distributed ring with {} peers", a.mlx_peers.len()));
+            push_log(&mut s.logs, &format!("Hostfile: {}", hostfile_path.display()));
+            s.dirty = true;
+            report_to_server(&self.client, &self.server_url, a.deployment_id, &s).await;
+        }
+
+        // Launch: mlx.launch --hostfile <path> --backend ring python -m mlx_lm.server --model <model> --port <port>
+        let mut child = Command::new("python3")
+            .arg("-m").arg("mlx.launch")
+            .arg("--hostfile").arg(&hostfile_path)
+            .arg("--backend").arg("ring")
+            .arg("python3").arg("-m").arg("mlx_lm.server")
+            .arg("--model").arg(&a.model)
+            .arg("--port").arg(a.port.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+
+        // Parse output
+        if let Some(stderr) = child.stderr.take() {
+            let state = self.states.get(&a.deployment_id).cloned();
+            let dep_id = a.deployment_id;
+            let port = a.port;
+            let client = self.client.clone();
+            let server_url = self.server_url.clone();
+            tokio::spawn(async move {
+                parse_mlx_distributed_output(stderr, state, dep_id, port, client, server_url).await;
+            });
+        }
+
+        if let Some(stdout) = child.stdout.take() {
+            let dep_id = a.deployment_id;
+            tokio::spawn(async move {
+                let reader = BufReader::new(stdout);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    eprintln!("[{:.8}|mlx-out] {}", dep_id, line);
+                }
+            });
         }
 
         Ok(child)
@@ -518,6 +604,58 @@ fn push_log(logs: &mut Vec<String>, line: &str) {
     logs.push(line.to_string());
     if logs.len() > MAX_LOG_LINES {
         logs.drain(0..logs.len() - MAX_LOG_LINES);
+    }
+}
+
+/// Parse MLX distributed output — tracks loading, sharding, and serving status
+async fn parse_mlx_distributed_output(
+    stderr: tokio::process::ChildStderr,
+    state: Option<Arc<Mutex<DeploymentState>>>,
+    dep_id: Uuid,
+    port: u16,
+    client: reqwest::Client,
+    server_url: String,
+) {
+    let reader = BufReader::new(stderr);
+    let mut lines = reader.lines();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        eprintln!("[{:.8}|mlx] {}", dep_id, line);
+
+        let Some(state) = &state else { continue };
+        let mut s = state.lock().await;
+        push_log(&mut s.logs, &line);
+
+        let mut changed = false;
+
+        if line.contains("Loading model") || line.contains("Fetching") {
+            s.status = DeploymentStatus::Loading;
+            s.progress = 20.0;
+            changed = true;
+        } else if line.contains("sharding") || line.contains("Shard") {
+            s.status = DeploymentStatus::Transferring;
+            s.progress = 50.0;
+            changed = true;
+        } else if line.contains("Uvicorn running") || line.contains("Starting server") || line.contains("server is listening") {
+            s.status = DeploymentStatus::Running;
+            s.progress = 100.0;
+            s.endpoint = Some(format!("http://0.0.0.0:{}", port));
+            changed = true;
+        } else if line.contains("error") || line.contains("Error") || line.contains("Traceback") {
+            s.error = Some(line.clone());
+            changed = true;
+        } else if line.contains("tok/s") || line.contains("tokens/s") {
+            // Try to parse throughput from MLX output
+            if let Some(tps) = parse_tok_per_sec(&line) {
+                s.last_tok_per_sec = Some(tps);
+                changed = true;
+            }
+        }
+
+        if changed {
+            s.dirty = true;
+            report_to_server(&client, &server_url, dep_id, &s).await;
+        }
     }
 }
 

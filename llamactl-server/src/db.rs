@@ -27,8 +27,14 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool> {
         .execute(&pool)
         .await?;
 
-    // Migration 005: add progress/logs columns (ignore if already exist)
+    // Migrations 005+: ALTER TABLE (ignore if already exist)
     for stmt in include_str!("../migrations/005_deployment_progress.sql").split(';') {
+        let stmt = stmt.trim();
+        if !stmt.is_empty() {
+            let _ = sqlx::query(stmt).execute(&pool).await;
+        }
+    }
+    for stmt in include_str!("../migrations/006_split_backend.sql").split(';') {
         let stmt = stmt.trim();
         if !stmt.is_empty() {
             let _ = sqlx::query(stmt).execute(&pool).await;

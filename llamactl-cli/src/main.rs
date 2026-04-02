@@ -38,10 +38,13 @@ enum Commands {
         /// GPU layers to offload (default: all)
         #[arg(long, default_value = "9999")]
         gpu_layers: u32,
-        /// Split model across multiple nodes (llama.cpp RPC tensor splitting)
-        /// Comma-separated node IDs: first is main, rest are RPC workers
+        /// Split model across multiple nodes
+        /// Comma-separated node IDs: first is main, rest are workers
         #[arg(long, value_delimiter = ',')]
         split: Vec<uuid::Uuid>,
+        /// Split backend: "rpc" (llama.cpp RPC, default) or "mlx" (MLX Distributed ring)
+        #[arg(long, default_value = "rpc")]
+        backend: String,
     },
     /// Stop and remove a deployment
     Stop {
@@ -86,8 +89,8 @@ async fn main() -> Result<()> {
             GetResource::Deployments => get_deployments(&cli.server).await?,
         },
         Commands::Deploy {
-            model, node, port, context_length, gpu_layers, split,
-        } => deploy(&cli.server, &client, model, node, port, context_length, gpu_layers, split).await?,
+            model, node, port, context_length, gpu_layers, split, backend,
+        } => deploy(&cli.server, &client, model, node, port, context_length, gpu_layers, split, &backend).await?,
         Commands::Stop { deployment_id } => {
             client
                 .delete(format!("{}/api/deployments/{deployment_id}", cli.server))
@@ -229,11 +232,21 @@ async fn deploy(
     context_length: u32,
     gpu_layers: u32,
     split: Vec<uuid::Uuid>,
+    backend: &str,
 ) -> Result<()> {
     let node_id = if !split.is_empty() {
         Some(split[0])
     } else {
         node
+    };
+
+    let split_backend = if split.len() > 1 {
+        match backend {
+            "mlx" => Some(SplitBackend::MlxRing),
+            _ => Some(SplitBackend::LlamaCppRpc),
+        }
+    } else {
+        None
     };
 
     let req = DeployRequest {
@@ -243,6 +256,7 @@ async fn deploy(
         context_length: Some(context_length),
         gpu_layers: Some(gpu_layers),
         split_nodes: split.clone(),
+        split_backend,
     };
 
     let resp: DeployResponse = client
@@ -261,10 +275,17 @@ async fn deploy(
     println!("  Node:   {} ({})", resp.node_hostname, &resp.node_id.to_string()[..8]);
     println!("  Status: {}", resp.status);
     if split.len() > 1 {
-        println!("  Mode:   split across {} nodes (llama.cpp RPC)", split.len());
+        let backend_name = match split_backend {
+            Some(SplitBackend::MlxRing) => "MLX Distributed ring",
+            _ => "llama.cpp RPC",
+        };
+        println!("  Mode:   split across {} nodes ({})", split.len(), backend_name);
         println!("          main: {}", &split[0].to_string()[..8]);
         for (i, worker) in split.iter().skip(1).enumerate() {
-            println!("          rpc-worker-{}: {}", i + 1, &worker.to_string()[..8]);
+            println!("          worker-{}: {}", i + 1, &worker.to_string()[..8]);
+        }
+        if split_backend == Some(SplitBackend::MlxRing) {
+            println!("\n  Requires: pip install mlx-lm, passwordless SSH between nodes");
         }
     }
     println!("\nAgents will pick this up within ~10 seconds.");

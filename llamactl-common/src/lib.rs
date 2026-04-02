@@ -119,6 +119,18 @@ pub enum AssignmentRole {
     Main,
     /// Runs llama.cpp rpc-server to provide compute layers to the main node
     RpcWorker,
+    /// Participates in MLX distributed ring (no separate process needed — main launches all via mlx.launch)
+    MlxRingPeer,
+}
+
+/// Which split backend to use for multi-node deployments
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitBackend {
+    /// llama.cpp RPC tensor splitting (cross-platform)
+    LlamaCppRpc,
+    /// MLX Distributed ring (Apple Silicon only, uses mlx.launch + SSH)
+    MlxRing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,10 +146,13 @@ pub struct DeployRequest {
     pub gpu_layers: Option<u32>,
     /// Port for the inference server on the worker (default: 8080)
     pub port: Option<u16>,
-    /// Split across multiple nodes (llama.cpp RPC tensor splitting)
-    /// If set, first node is main, rest are RPC workers
+    /// Split across multiple nodes
+    /// If set, first node is main, rest are workers
     #[serde(default)]
     pub split_nodes: Vec<Uuid>,
+    /// Which split backend to use (default: llama_cpp_rpc)
+    #[serde(default)]
+    pub split_backend: Option<SplitBackend>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +213,12 @@ pub struct NodeAssignment {
     /// For main nodes in a split deployment: list of "host:port" for RPC workers
     #[serde(default)]
     pub rpc_servers: Vec<String>,
+    /// Which split backend is being used
+    #[serde(default)]
+    pub split_backend: Option<SplitBackend>,
+    /// For MLX ring: all peer hostnames/IPs in the ring (main generates hostfile from these)
+    #[serde(default)]
+    pub mlx_peers: Vec<String>,
 }
 
 fn default_role() -> AssignmentRole {

@@ -335,9 +335,12 @@ pub async fn create_deployment(
     let deployment_id = Uuid::new_v4();
     let now = Utc::now().to_rfc3339();
 
+    let split_backend_str = req.split_backend
+        .map(|b| serde_json::to_value(&b).unwrap().as_str().unwrap().to_string());
+
     sqlx::query(
-        "INSERT INTO deployments (id, model, node_id, status, port, context_length, gpu_layers, created_at)
-         VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)"
+        "INSERT INTO deployments (id, model, node_id, status, port, context_length, gpu_layers, created_at, split_backend)
+         VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)"
     )
     .bind(deployment_id.to_string())
     .bind(&req.model)
@@ -346,14 +349,15 @@ pub async fn create_deployment(
     .bind(ctx_len as i32)
     .bind(gpu_layers as i32)
     .bind(&now)
+    .bind(&split_backend_str)
     .execute(&pool)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Handle split deployment: register workers
     if !req.split_nodes.is_empty() {
-        // First node in split_nodes is main, rest are RPC workers
         let main_id = req.split_nodes[0].to_string();
+        let is_mlx = req.split_backend == Some(SplitBackend::MlxRing);
         let rpc_port = 50052i32;
 
         // Register main node
@@ -362,29 +366,33 @@ pub async fn create_deployment(
         )
         .bind(deployment_id.to_string())
         .bind(&main_id)
-        .bind(rpc_port)
+        .bind(if is_mlx { port as i32 } else { rpc_port })
         .execute(&pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // Register RPC workers
+        // Register workers
         for (i, worker_id) in req.split_nodes.iter().skip(1).enumerate() {
-            let worker_rpc_port = rpc_port + i as i32 + 1;
+            let role = if is_mlx { "mlx_ring_peer" } else { "rpc_worker" };
+            let worker_rpc_port = if is_mlx { port as i32 } else { rpc_port + i as i32 + 1 };
             sqlx::query(
-                "INSERT INTO deployment_workers (deployment_id, node_id, role, rpc_port) VALUES (?, ?, 'rpc_worker', ?)"
+                "INSERT INTO deployment_workers (deployment_id, node_id, role, rpc_port) VALUES (?, ?, ?, ?)"
             )
             .bind(deployment_id.to_string())
             .bind(worker_id.to_string())
+            .bind(role)
             .bind(worker_rpc_port)
             .execute(&pool)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
 
+        let backend_name = if is_mlx { "MLX ring" } else { "llama.cpp RPC" };
         tracing::info!(
             deployment_id = %deployment_id,
             model = %req.model,
             nodes = req.split_nodes.len(),
+            backend = backend_name,
             "Split deployment created"
         );
     } else {
@@ -510,6 +518,9 @@ pub async fn get_assignments(
         .await
         .unwrap_or_default();
 
+        let dep_split_backend: Option<SplitBackend> = r.split_backend.as_ref()
+            .and_then(|s| serde_json::from_value(serde_json::Value::String(s.clone())).ok());
+
         if workers.is_empty() {
             // Simple single-node deployment
             assignments.push(NodeAssignment {
@@ -520,6 +531,8 @@ pub async fn get_assignments(
                 gpu_layers: r.gpu_layers as u32,
                 role: AssignmentRole::Main,
                 rpc_servers: vec![],
+                split_backend: None,
+                mlx_peers: vec![],
             });
         } else {
             // Split deployment — find this node's role
@@ -528,11 +541,20 @@ pub async fn get_assignments(
                     serde_json::Value::String(my_role.role.clone())
                 ).unwrap_or(AssignmentRole::Main);
 
-                // If main, gather RPC worker addresses
+                // If main, gather worker addresses
                 let rpc_servers = if role == AssignmentRole::Main {
                     workers.iter()
                         .filter(|w| w.role == "rpc_worker")
                         .map(|w| format!("{}:{}", w.hostname, w.rpc_port))
+                        .collect()
+                } else {
+                    vec![]
+                };
+
+                // For MLX ring: collect all peer IPs (main uses this to build hostfile)
+                let mlx_peers = if role == AssignmentRole::Main && dep_split_backend == Some(SplitBackend::MlxRing) {
+                    workers.iter()
+                        .map(|w| w.hostname.clone())
                         .collect()
                 } else {
                     vec![]
@@ -550,6 +572,8 @@ pub async fn get_assignments(
                     gpu_layers: r.gpu_layers as u32,
                     role,
                     rpc_servers,
+                    split_backend: dep_split_backend,
+                    mlx_peers,
                 });
             }
         }
@@ -560,7 +584,7 @@ pub async fn get_assignments(
         "SELECT dw.deployment_id, dw.node_id, dw.role, dw.rpc_port, n.hostname
          FROM deployment_workers dw
          JOIN nodes n ON dw.node_id = n.id
-         WHERE dw.node_id = ? AND dw.role = 'rpc_worker'"
+         WHERE dw.node_id = ? AND dw.role IN ('rpc_worker', 'mlx_ring_peer')"
     )
     .bind(&node_str)
     .fetch_all(&pool)
@@ -568,13 +592,11 @@ pub async fn get_assignments(
     .unwrap_or_default();
 
     for wr in worker_rows {
-        // Check if we already have this deployment
         let dep_id = Uuid::parse_str(&wr.deployment_id).unwrap();
         if assignments.iter().any(|a| a.deployment_id == dep_id) {
             continue;
         }
 
-        // Fetch the deployment details
         if let Ok(Some(dep)) = sqlx::query_as::<_, DeploymentRow>(
             "SELECT d.*, n.hostname as node_hostname FROM deployments d
              JOIN nodes n ON d.node_id = n.id
@@ -584,14 +606,29 @@ pub async fn get_assignments(
         .fetch_optional(&pool)
         .await
         {
+            let role: AssignmentRole = serde_json::from_value(
+                serde_json::Value::String(wr.role.clone())
+            ).unwrap_or(AssignmentRole::RpcWorker);
+
+            let dep_split_backend: Option<SplitBackend> = dep.split_backend.as_ref()
+                .and_then(|s| serde_json::from_value(serde_json::Value::String(s.clone())).ok());
+
+            // MLX ring peers don't need a separate process — main launches everything via SSH
+            // So we don't assign them work; they just need to exist in the topology
+            if role == AssignmentRole::MlxRingPeer {
+                continue;
+            }
+
             assignments.push(NodeAssignment {
                 deployment_id: dep_id,
                 model: dep.model,
                 port: wr.rpc_port as u16,
                 context_length: dep.context_length as u32,
                 gpu_layers: dep.gpu_layers as u32,
-                role: AssignmentRole::RpcWorker,
+                role,
                 rpc_servers: vec![],
+                split_backend: dep_split_backend,
+                mlx_peers: vec![],
             });
         }
     }
@@ -751,6 +788,7 @@ struct DeploymentRow {
     progress: f64,
     logs: String,
     last_tok_per_sec: Option<f64>,
+    split_backend: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
