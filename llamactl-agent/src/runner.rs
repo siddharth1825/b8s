@@ -275,14 +275,13 @@ impl Runner {
         // Parse RPC worker output
         if let Some(stderr) = child.stderr.take() {
             let state = self.states.get(&a.deployment_id).cloned();
+            let dep_id = a.deployment_id;
             tokio::spawn(async move {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    // Log important lines
-                    if line.contains("Accepted client") || line.contains("Starting RPC") || line.contains("error") {
-                        tracing::info!(target: "rpc-worker", "{}", line);
-                    }
+                    // Print all lines to terminal
+                    eprintln!("[{:.8}|rpc] {}", dep_id, line);
                     if let Some(state) = &state {
                         let mut s = state.lock().await;
                         push_log(&mut s.logs, &line);
