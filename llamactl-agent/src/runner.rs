@@ -155,16 +155,8 @@ impl Runner {
     }
 
     async fn start_inference(&self, assignment: &NodeAssignment) -> Result<Child> {
-        // MLX ring peers don't need to start anything — main handles everything via mlx.launch
-        if assignment.role == AssignmentRole::MlxRingPeer {
-            anyhow::bail!("MLX ring peers are launched by the main node via SSH");
-        }
-
-        // MLX ring main — use mlx.launch with hostfile
-        if assignment.role == AssignmentRole::Main
-            && assignment.split_backend == Some(SplitBackend::MlxRing)
-            && !assignment.mlx_peers.is_empty()
-        {
+        // MLX ring — each node starts its own process with rank/hostfile env vars
+        if assignment.split_backend == Some(SplitBackend::MlxRing) && !assignment.mlx_peers.is_empty() {
             return self.start_mlx_distributed(assignment).await;
         }
 
@@ -329,93 +321,81 @@ impl Runner {
         Ok(child)
     }
 
-    /// Start MLX Distributed ring — generates hostfile and uses mlx.launch
+    /// Start MLX Distributed — each node runs its own mlx_lm.server with rank env vars
+    /// No SSH needed — agents are already running on every machine
     async fn start_mlx_distributed(&self, a: &NodeAssignment) -> Result<Child> {
+        let is_main = a.mlx_rank == 0;
         tracing::info!(
+            rank = a.mlx_rank,
             peers = ?a.mlx_peers,
             model = %a.model,
             port = a.port,
-            "Starting MLX Distributed ring"
+            role = if is_main { "main (rank 0, serves HTTP)" } else { "worker" },
+            "Starting MLX Distributed node"
         );
 
-        // Generate hostfile JSON
-        // LLAMACTL_SSH_USER overrides the SSH user for remote nodes (default: current user)
-        let ssh_user = std::env::var("LLAMACTL_SSH_USER").ok();
-        let local_ip = crate::detect::detect_lan_ip_pub();
-
-        let hostfile: Vec<serde_json::Value> = a.mlx_peers.iter().map(|ip| {
-            // Don't add SSH user for the local machine
-            let ssh_target = if Some(ip.as_str()) == local_ip.as_deref() {
-                ip.clone()
-            } else if let Some(ref user) = ssh_user {
-                format!("{}@{}", user, ip)
-            } else {
-                ip.clone()
-            };
-            serde_json::json!({
-                "ssh": ssh_target,
-                "ips": [ip]
-            })
+        // Generate ring hostfile: [["ip1:port1"], ["ip2:port2"]]
+        // Ring port = 32323 + rank (default mlx convention)
+        let ring_base_port = 32323u16;
+        let hostfile: Vec<Vec<String>> = a.mlx_peers.iter().enumerate().map(|(i, ip)| {
+            vec![format!("{}:{}", ip, ring_base_port + i as u16)]
         }).collect();
 
-        // Write hostfile to temp dir
-        let hostfile_path = std::env::temp_dir().join(format!("llamactl-mlx-hosts-{}.json", a.deployment_id));
-        std::fs::write(&hostfile_path, serde_json::to_string_pretty(&hostfile)?)?;
+        let hostfile_path = std::env::temp_dir().join(format!("llamactl-mlx-ring-{}.json", a.deployment_id));
+        std::fs::write(&hostfile_path, serde_json::to_string(&hostfile)?)?;
 
-        tracing::info!(hostfile = %hostfile_path.display(), "Generated MLX hostfile");
+        tracing::info!(
+            hostfile = %hostfile_path.display(),
+            rank = a.mlx_rank,
+            "Generated MLX ring hostfile"
+        );
 
         if let Some(state) = self.states.get(&a.deployment_id) {
             let mut s = state.lock().await;
             s.status = DeploymentStatus::Starting;
             s.progress = 5.0;
-            push_log(&mut s.logs, &format!("MLX Distributed ring with {} peers", a.mlx_peers.len()));
-            push_log(&mut s.logs, &format!("Hostfile: {}", hostfile_path.display()));
+            push_log(&mut s.logs, &format!(
+                "MLX ring rank {} of {} ({})",
+                a.mlx_rank, a.mlx_peers.len(),
+                if is_main { "main — serves HTTP" } else { "worker — compute only" }
+            ));
             s.dirty = true;
             report_to_server(&self.client, &self.server_url, a.deployment_id, &s).await;
         }
 
-        // Launch: mlx.launch --hostfile <path> --backend ring python3 -m mlx_lm.server --model <model> --port <port>
-        // Try mlx.launch binary first, fall back to python3 -m mlx.launch
-        let (launch_cmd, launch_args): (String, Vec<String>) = if which::which("mlx.launch").is_ok() {
-            ("mlx.launch".into(), vec![])
-        } else {
-            ("python3".into(), vec!["-m".into(), "mlx.launch".into()])
-        };
-
-        let mut cmd = Command::new(&launch_cmd);
-        for arg in &launch_args {
-            cmd.arg(arg);
-        }
-        let mut child = cmd
-            .arg("--hostfile").arg(&hostfile_path)
-            .arg("--backend").arg("ring")
-            .arg("python3").arg("-m").arg("mlx_lm.server")
+        // Each node runs: python3 -m mlx_lm.server --model <model> --port <port>
+        // with MLX_RANK and MLX_HOSTFILE set
+        let mut child = Command::new("python3")
+            .arg("-m").arg("mlx_lm.server")
             .arg("--model").arg(&a.model)
             .arg("--port").arg(a.port.to_string())
+            .env("MLX_RANK", a.mlx_rank.to_string())
+            .env("MLX_HOSTFILE", &hostfile_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
 
-        // Parse output
         if let Some(stderr) = child.stderr.take() {
             let state = self.states.get(&a.deployment_id).cloned();
             let dep_id = a.deployment_id;
             let port = a.port;
             let client = self.client.clone();
             let server_url = self.server_url.clone();
+            let rank = a.mlx_rank;
             tokio::spawn(async move {
-                parse_mlx_distributed_output(stderr, state, dep_id, port, client, server_url).await;
+                parse_mlx_distributed_output(stderr, state, dep_id, port, rank, client, server_url).await;
             });
         }
 
         if let Some(stdout) = child.stdout.take() {
             let dep_id = a.deployment_id;
+            let rank = a.mlx_rank;
             tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    eprintln!("[{:.8}|mlx-out] {}", dep_id, line);
+                    eprintln!("[{:.8}|mlx-r{}] {}", dep_id, rank, line);
                 }
             });
         }
@@ -635,6 +615,7 @@ async fn parse_mlx_distributed_output(
     state: Option<Arc<Mutex<DeploymentState>>>,
     dep_id: Uuid,
     port: u16,
+    rank: u32,
     client: reqwest::Client,
     server_url: String,
 ) {
@@ -642,7 +623,7 @@ async fn parse_mlx_distributed_output(
     let mut lines = reader.lines();
 
     while let Ok(Some(line)) = lines.next_line().await {
-        eprintln!("[{:.8}|mlx] {}", dep_id, line);
+        eprintln!("[{:.8}|mlx-r{}] {}", dep_id, rank, line);
 
         let Some(state) = &state else { continue };
         let mut s = state.lock().await;

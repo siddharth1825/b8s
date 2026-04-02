@@ -216,9 +216,12 @@ pub struct NodeAssignment {
     /// Which split backend is being used
     #[serde(default)]
     pub split_backend: Option<SplitBackend>,
-    /// For MLX ring: all peer hostnames/IPs in the ring (main generates hostfile from these)
+    /// For MLX ring: all peer IPs in the ring
     #[serde(default)]
     pub mlx_peers: Vec<String>,
+    /// For MLX ring: this node's rank (0 = main, serves HTTP)
+    #[serde(default)]
+    pub mlx_rank: u32,
 }
 
 fn default_role() -> AssignmentRole {

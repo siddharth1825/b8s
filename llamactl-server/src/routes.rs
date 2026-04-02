@@ -533,6 +533,7 @@ pub async fn get_assignments(
                 rpc_servers: vec![],
                 split_backend: None,
                 mlx_peers: vec![],
+                mlx_rank: 0,
             });
         } else {
             // Split deployment — find this node's role
@@ -541,7 +542,7 @@ pub async fn get_assignments(
                     serde_json::Value::String(my_role.role.clone())
                 ).unwrap_or(AssignmentRole::Main);
 
-                // If main, gather worker addresses
+                // If main, gather RPC worker addresses
                 let rpc_servers = if role == AssignmentRole::Main {
                     workers.iter()
                         .filter(|w| w.role == "rpc_worker")
@@ -551,13 +552,14 @@ pub async fn get_assignments(
                     vec![]
                 };
 
-                // For MLX ring: collect all peer IPs (main uses this to build hostfile)
-                let mlx_peers = if role == AssignmentRole::Main && dep_split_backend == Some(SplitBackend::MlxRing) {
-                    workers.iter()
-                        .map(|w| w.hostname.clone())
-                        .collect()
+                // For MLX ring: ALL nodes get the full peer list and their rank
+                let (mlx_peers, mlx_rank) = if dep_split_backend == Some(SplitBackend::MlxRing) {
+                    let peers: Vec<String> = workers.iter().map(|w| w.hostname.clone()).collect();
+                    // Rank = position in workers list
+                    let rank = workers.iter().position(|w| w.node_id == node_str).unwrap_or(0) as u32;
+                    (peers, rank)
                 } else {
-                    vec![]
+                    (vec![], 0)
                 };
 
                 assignments.push(NodeAssignment {
@@ -574,6 +576,7 @@ pub async fn get_assignments(
                     rpc_servers,
                     split_backend: dep_split_backend,
                     mlx_peers,
+                    mlx_rank,
                 });
             }
         }
@@ -613,11 +616,23 @@ pub async fn get_assignments(
             let dep_split_backend: Option<SplitBackend> = dep.split_backend.as_ref()
                 .and_then(|s| serde_json::from_value(serde_json::Value::String(s.clone())).ok());
 
-            // MLX ring peers don't need a separate process — main launches everything via SSH
-            // So we don't assign them work; they just need to exist in the topology
-            if role == AssignmentRole::MlxRingPeer {
-                continue;
-            }
+            // For MLX ring peers: fetch all workers to build peer list + rank
+            let (mlx_peers, mlx_rank) = if role == AssignmentRole::MlxRingPeer {
+                let all_workers = sqlx::query_as::<_, DeploymentWorkerRow>(
+                    "SELECT dw.deployment_id, dw.node_id, dw.role, dw.rpc_port, n.hostname
+                     FROM deployment_workers dw JOIN nodes n ON dw.node_id = n.id
+                     WHERE dw.deployment_id = ?"
+                )
+                .bind(&wr.deployment_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_default();
+                let peers: Vec<String> = all_workers.iter().map(|w| w.hostname.clone()).collect();
+                let rank = all_workers.iter().position(|w| w.node_id == node_str).unwrap_or(0) as u32;
+                (peers, rank)
+            } else {
+                (vec![], 0)
+            };
 
             assignments.push(NodeAssignment {
                 deployment_id: dep_id,
@@ -628,7 +643,8 @@ pub async fn get_assignments(
                 role,
                 rpc_servers: vec![],
                 split_backend: dep_split_backend,
-                mlx_peers: vec![],
+                mlx_peers,
+                mlx_rank,
             });
         }
     }
