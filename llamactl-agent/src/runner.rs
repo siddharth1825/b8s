@@ -362,9 +362,19 @@ impl Runner {
             report_to_server(&self.client, &self.server_url, a.deployment_id, &s).await;
         }
 
-        // Launch: mlx.launch --hostfile <path> --backend ring python -m mlx_lm.server --model <model> --port <port>
-        let mut child = Command::new("python3")
-            .arg("-m").arg("mlx.launch")
+        // Launch: mlx.launch --hostfile <path> --backend ring python3 -m mlx_lm.server --model <model> --port <port>
+        // Try mlx.launch binary first, fall back to python3 -m mlx.launch
+        let (launch_cmd, launch_args): (String, Vec<String>) = if which::which("mlx.launch").is_ok() {
+            ("mlx.launch".into(), vec![])
+        } else {
+            ("python3".into(), vec!["-m".into(), "mlx.launch".into()])
+        };
+
+        let mut cmd = Command::new(&launch_cmd);
+        for arg in &launch_args {
+            cmd.arg(arg);
+        }
+        let mut child = cmd
             .arg("--hostfile").arg(&hostfile_path)
             .arg("--backend").arg("ring")
             .arg("python3").arg("-m").arg("mlx_lm.server")
