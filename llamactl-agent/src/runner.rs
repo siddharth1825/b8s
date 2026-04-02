@@ -233,14 +233,16 @@ impl Runner {
             .kill_on_drop(true)
             .spawn()?;
 
-        // Spawn log parser for stderr
+        // Spawn log parser for stderr — reports status directly to server
         if let Some(stderr) = child.stderr.take() {
             let state = self.states.get(&a.deployment_id).cloned();
             let dep_id = a.deployment_id;
             let port = a.port;
             let rpc_count = a.rpc_servers.len();
+            let client = self.client.clone();
+            let server_url = self.server_url.clone();
             tokio::spawn(async move {
-                parse_llama_output(stderr, state, dep_id, port, rpc_count).await;
+                parse_llama_output(stderr, state, dep_id, port, rpc_count, client, server_url).await;
             });
         }
 
@@ -405,69 +407,96 @@ impl Runner {
     }
 }
 
-/// Parse llama-server stderr output, updating deployment state in real time
+/// Report status directly to the server (used by log parser tasks)
+async fn report_to_server(
+    client: &reqwest::Client,
+    server_url: &str,
+    dep_id: Uuid,
+    s: &DeploymentState,
+) {
+    let update = DeploymentStatusUpdate {
+        status: s.status,
+        endpoint: s.endpoint.clone(),
+        error: s.error.clone(),
+        progress: s.progress,
+        logs: s.logs.clone(),
+        last_tok_per_sec: s.last_tok_per_sec,
+    };
+    let _ = client
+        .put(format!("{}/api/deployments/{}/status", server_url, dep_id))
+        .json(&update)
+        .send()
+        .await;
+}
+
+/// Parse llama-server stderr output, updating deployment state and reporting in real time
 async fn parse_llama_output(
     stderr: tokio::process::ChildStderr,
     state: Option<Arc<Mutex<DeploymentState>>>,
     dep_id: Uuid,
     port: u16,
     rpc_count: usize,
+    client: reqwest::Client,
+    server_url: String,
 ) {
     let reader = BufReader::new(stderr);
     let mut lines = reader.lines();
-    let total_stages = if rpc_count > 0 { 4 } else { 3 }; // fit, load, warmup, (rpc connect)
+    let total_stages = if rpc_count > 0 { 4 } else { 3 };
     let mut current_stage = 0;
 
     while let Ok(Some(line)) = lines.next_line().await {
-        // Always log to terminal
         eprintln!("[{:.8}] {}", dep_id, line);
 
         let Some(state) = &state else { continue };
         let mut s = state.lock().await;
         push_log(&mut s.logs, &line);
 
-        // Parse progress stages from llama-server output
+        let mut changed = false;
+
         if line.contains("fitting params to") {
             s.status = DeploymentStatus::Loading;
             s.progress = 10.0;
-            s.dirty = true;
+            changed = true;
         } else if line.contains("loading model tensors") {
             s.status = DeploymentStatus::Transferring;
             s.progress = 20.0;
-            s.dirty = true;
+            changed = true;
         } else if line.contains("RPC") && line.contains("model buffer size") {
-            // RPC buffer transfer in progress
             current_stage += 1;
             let rpc_progress = 20.0 + (current_stage as f32 / total_stages as f32) * 40.0;
             s.progress = rpc_progress.min(60.0);
-            s.dirty = true;
+            changed = true;
         } else if line.contains("MTL0") && line.contains("model buffer size") {
             s.progress = 60.0;
-            s.dirty = true;
+            changed = true;
         } else if line.contains("offloaded") && line.contains("layers to GPU") {
             s.progress = 70.0;
-            s.dirty = true;
+            changed = true;
         } else if line.contains("warming up") {
             s.status = DeploymentStatus::WarmingUp;
             s.progress = 80.0;
-            s.dirty = true;
+            changed = true;
         } else if line.contains("model loaded") {
             s.progress = 95.0;
-            s.dirty = true;
+            changed = true;
         } else if line.contains("server is listening") {
             s.status = DeploymentStatus::Running;
             s.progress = 100.0;
             s.endpoint = Some(format!("http://0.0.0.0:{}", port));
-            s.dirty = true;
-        } else if line.contains("predicted_per_second") || line.contains("eval time") {
-            // Parse tok/s from timing line: "eval time = X ms / Y tokens (Z ms per token, W tokens per second)"
+            changed = true;
+        } else if line.contains("eval time") {
             if let Some(tps) = parse_tok_per_sec(&line) {
                 s.last_tok_per_sec = Some(tps);
-                s.dirty = true;
+                changed = true;
             }
         } else if line.contains("error") || line.contains("failed") || line.contains("GGML_ABORT") {
             s.error = Some(line.clone());
+            changed = true;
+        }
+
+        if changed {
             s.dirty = true;
+            report_to_server(&client, &server_url, dep_id, &s).await;
         }
     }
 }
