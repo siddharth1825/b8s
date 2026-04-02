@@ -44,6 +44,11 @@ pub fn detect_hardware() -> HardwareInfo {
     }
 }
 
+/// Detect the primary LAN IP (public wrapper for runner)
+pub fn detect_lan_ip_pub() -> Option<String> {
+    detect_lan_ip()
+}
+
 /// Detect the primary LAN IP by opening a UDP socket to a public address.
 /// No traffic is actually sent — this just lets the OS pick the right interface.
 fn detect_lan_ip() -> Option<String> {

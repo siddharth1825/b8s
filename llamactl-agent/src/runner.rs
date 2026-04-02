@@ -339,9 +339,21 @@ impl Runner {
         );
 
         // Generate hostfile JSON
+        // LLAMACTL_SSH_USER overrides the SSH user for remote nodes (default: current user)
+        let ssh_user = std::env::var("LLAMACTL_SSH_USER").ok();
+        let local_ip = crate::detect::detect_lan_ip_pub();
+
         let hostfile: Vec<serde_json::Value> = a.mlx_peers.iter().map(|ip| {
+            // Don't add SSH user for the local machine
+            let ssh_target = if Some(ip.as_str()) == local_ip.as_deref() {
+                ip.clone()
+            } else if let Some(ref user) = ssh_user {
+                format!("{}@{}", user, ip)
+            } else {
+                ip.clone()
+            };
             serde_json::json!({
-                "ssh": ip,
+                "ssh": ssh_target,
                 "ips": [ip]
             })
         }).collect();
