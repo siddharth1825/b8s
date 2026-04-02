@@ -485,7 +485,7 @@ pub async fn get_assignments(
     let rows = sqlx::query_as::<_, DeploymentRow>(
         "SELECT d.*, n.hostname as node_hostname FROM deployments d
          JOIN nodes n ON d.node_id = n.id
-         WHERE d.node_id = ? AND d.status IN ('pending', 'running', 'downloading')"
+         WHERE d.node_id = ? AND d.status NOT IN ('stopped', 'failed', 'paused')"
     )
     .bind(&node_str)
     .fetch_all(&pool)
@@ -578,7 +578,7 @@ pub async fn get_assignments(
         if let Ok(Some(dep)) = sqlx::query_as::<_, DeploymentRow>(
             "SELECT d.*, n.hostname as node_hostname FROM deployments d
              JOIN nodes n ON d.node_id = n.id
-             WHERE d.id = ? AND d.status IN ('pending', 'running', 'downloading')"
+             WHERE d.id = ? AND d.status NOT IN ('stopped', 'failed', 'paused')"
         )
         .bind(&wr.deployment_id)
         .fetch_optional(&pool)
