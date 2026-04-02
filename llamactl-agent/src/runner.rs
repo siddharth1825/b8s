@@ -172,6 +172,48 @@ impl Runner {
                 "llama-server not found in PATH"
             ))?;
 
+        // Wait for RPC workers to be reachable before starting llama-server
+        if !a.rpc_servers.is_empty() {
+            if let Some(state) = self.states.get(&a.deployment_id) {
+                let mut s = state.lock().await;
+                s.status = DeploymentStatus::Starting;
+                s.progress = 5.0;
+                push_log(&mut s.logs, &format!("Waiting for {} RPC worker(s)...", a.rpc_servers.len()));
+                s.dirty = true;
+                self.report_status_from_state(a.deployment_id, &s).await;
+            }
+
+            for rpc in &a.rpc_servers {
+                tracing::info!(rpc = %rpc, "Waiting for RPC worker to be reachable...");
+                let mut attempts = 0;
+                loop {
+                    match tokio::net::TcpStream::connect(rpc).await {
+                        Ok(_) => {
+                            tracing::info!(rpc = %rpc, "RPC worker is reachable");
+                            if let Some(state) = self.states.get(&a.deployment_id) {
+                                let mut s = state.lock().await;
+                                push_log(&mut s.logs, &format!("Connected to RPC worker {}", rpc));
+                                s.dirty = true;
+                            }
+                            break;
+                        }
+                        Err(_) => {
+                            attempts += 1;
+                            if attempts > 60 {
+                                return Err(anyhow::anyhow!(
+                                    "RPC worker {} not reachable after 60 attempts (2 min)", rpc
+                                ));
+                            }
+                            if attempts % 5 == 0 {
+                                tracing::info!(rpc = %rpc, attempt = attempts, "Still waiting for RPC worker...");
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        }
+                    }
+                }
+            }
+        }
+
         let mut cmd = Command::new(bin);
         cmd.arg("-m").arg(&a.model)
             .arg("--port").arg(a.port.to_string())
