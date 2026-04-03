@@ -68,6 +68,11 @@ enum Commands {
     },
     /// Live interactive cluster dashboard
     Top,
+    /// Analyze a GGUF model for heterogeneous split inference
+    Analyze {
+        /// Path to GGUF model file
+        model: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -136,6 +141,96 @@ async fn main() -> Result<()> {
             println!("Node {} removed.", &node_id.to_string()[..8]);
         }
         Commands::Top => tui::run(&cli.server).await?,
+        Commands::Analyze { model } => analyze_model(&model)?,
+    }
+
+    Ok(())
+}
+
+fn analyze_model(path: &str) -> Result<()> {
+    use llamactl_engine::{categorize_tensors, GgufFile, InferenceDag, TensorCategory, DevicePlacement};
+    use std::collections::HashMap;
+
+    println!("Loading GGUF: {}\n", path);
+    let gguf = GgufFile::open(path)?;
+
+    println!("Architecture: {}", gguf.architecture().unwrap_or("unknown"));
+    println!("Model:        {}", gguf.model_name().unwrap_or("unknown"));
+    println!("Version:      GGUF v{}", gguf.version);
+    println!("Tensors:      {}", gguf.tensors.len());
+    println!("Layers:       {}", gguf.n_layers().unwrap_or(0));
+    println!("Experts:      {} ({} active/token)",
+        gguf.n_experts().unwrap_or(0), gguf.n_experts_used().unwrap_or(0));
+    println!("Embedding:    {}", gguf.embedding_dim().unwrap_or(0));
+    println!("Total size:   {:.1} MB ({:.2} GB)\n",
+        gguf.total_size_mb(), gguf.total_size_mb() / 1024.0);
+
+    // Categorize tensors
+    let categorized = categorize_tensors(&gguf);
+
+    // Summary by category
+    let mut by_category: HashMap<TensorCategory, (usize, f64)> = HashMap::new();
+    for t in &categorized {
+        let entry = by_category.entry(t.category).or_default();
+        entry.0 += 1;
+        entry.1 += t.size_bytes as f64 / (1024.0 * 1024.0);
+    }
+
+    let total_mb: f64 = by_category.values().map(|v| v.1).sum();
+
+    println!("Tensor breakdown by operation type:");
+    println!("  {:<15} {:>6} {:>10} {:>6}", "CATEGORY", "COUNT", "SIZE (MB)", "%");
+    let mut sorted: Vec<_> = by_category.iter().collect();
+    sorted.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+    for (cat, (count, mb)) in &sorted {
+        println!("  {:<15} {:>6} {:>10.1} {:>5.1}%", cat, count, mb, mb / total_mb * 100.0);
+    }
+
+    // Summary by device
+    let mut by_device: HashMap<DevicePlacement, f64> = HashMap::new();
+    for t in &categorized {
+        *by_device.entry(t.placement).or_default() += t.size_bytes as f64 / (1024.0 * 1024.0);
+    }
+
+    println!("\nDevice placement:");
+    for (device, mb) in &by_device {
+        let label = match device {
+            DevicePlacement::FastGpu => "Fast GPU (attention, router, SSM)",
+            DevicePlacement::BigMemory => "Big Memory (experts, shared FFN)",
+            DevicePlacement::Replicated => "Replicated (norms, embeddings)",
+        };
+        println!("  {:?}: {:.0} MB — {}", device, mb, label);
+    }
+
+    // Build and analyze DAG
+    let dag = InferenceDag::build(&gguf);
+    let (xfer_count, xfer_bytes) = dag.cross_device_transfers();
+
+    println!("\nInference DAG:");
+    println!("  Operations per forward pass: {}", dag.nodes.len());
+    println!("  Edges: {}", dag.edges.len());
+    println!("  Cross-device transfers/token: {} ({:.1} KB)",
+        xfer_count, xfer_bytes as f64 / 1024.0);
+
+    // Network overhead estimates
+    println!("\nNetwork overhead per token:");
+    for (name, bw_gbps) in [("1 Gbps ethernet", 1.0), ("10 Gbps ethernet", 10.0), ("Thunderbolt 3", 40.0)] {
+        let ms = (xfer_bytes as f64 / (bw_gbps * 125.0 * 1024.0 * 1024.0)) * 1000.0;
+        println!("  {}: {:.2} ms", name, ms);
+    }
+
+    // Feasibility check for specific hardware
+    println!("\nHardware fit check:");
+    let fast_mb = by_device.get(&DevicePlacement::FastGpu).unwrap_or(&0.0)
+        + by_device.get(&DevicePlacement::Replicated).unwrap_or(&0.0);
+    let big_mb = by_device.get(&DevicePlacement::BigMemory).unwrap_or(&0.0)
+        + by_device.get(&DevicePlacement::Replicated).unwrap_or(&0.0);
+
+    for (name, vram_mb) in [("RTX 3070 Ti 8GB", 8192.0), ("RTX 4090 24GB", 24576.0), ("M4 Pro 24GB", 24576.0), ("M4 Max 128GB", 131072.0)] {
+        let fast_fit = if fast_mb < vram_mb { "OK" } else { "TOO BIG" };
+        let big_fit = if big_mb < vram_mb { "OK" } else { "TOO BIG" };
+        println!("  {} as fast GPU: {:.0}/{:.0} MB [{}]", name, fast_mb, vram_mb, fast_fit);
+        println!("  {} as big memory: {:.0}/{:.0} MB [{}]", name, big_mb, vram_mb, big_fit);
     }
 
     Ok(())

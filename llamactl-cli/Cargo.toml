@@ -19,5 +19,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
+llamactl-engine = { workspace = true }
 ratatui = "0.28"
 crossterm = "0.28"

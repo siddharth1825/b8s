@@ -1,0 +1,12 @@
+[package]
+name = "llamactl-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+llamactl-common = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+memmap2 = "0.9"

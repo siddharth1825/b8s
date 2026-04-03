@@ -5,6 +5,7 @@ members = [
     "llamactl-server",
     "llamactl-agent",
     "llamactl-cli",
+    "llamactl-engine",
 ]
 
 [workspace.package]
@@ -14,6 +15,7 @@ license = "MIT"
 
 [workspace.dependencies]
 llamactl-common = { path = "llamactl-common" }
+llamactl-engine = { path = "llamactl-engine" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
