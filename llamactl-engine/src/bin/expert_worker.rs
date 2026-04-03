@@ -29,7 +29,8 @@ async fn main() -> Result<()> {
         .unwrap_or(50100);
 
     tracing::info!(model = %model_path, port, "Loading model for expert worker...");
-    let model = Arc::new(LoadedModel::load(model_path)?);
+    // Expert worker always uses CPU — it's the big memory device
+    let model = Arc::new(LoadedModel::load_with_device(model_path, &candle_core::Device::Cpu)?);
     tracing::info!("{}", model.memory_summary());
 
     let addr = format!("0.0.0.0:{}", port).parse()?;
