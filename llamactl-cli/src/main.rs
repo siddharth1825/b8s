@@ -257,7 +257,7 @@ fn analyze_model(path: &str, load_tensors: bool) -> Result<()> {
 
         let mut kv_cache = llamactl_engine::inference::KvCache::new();
         let start = std::time::Instant::now();
-        let output = llamactl_engine::inference::forward_layer(&x, &model, 0, &mut kv_cache, true)?;
+        let output = llamactl_engine::inference::forward_layer(&x, &model, 0, &mut kv_cache)?;
         let elapsed = start.elapsed();
 
         println!("Output shape: {:?}", output.shape());
