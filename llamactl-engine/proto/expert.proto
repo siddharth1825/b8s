@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package expert;
+
+// ExpertCompute service — runs on the big memory device.
+// The fast GPU sends hidden states + expert indices after routing,
+// and the big memory device computes the sparse FFN and returns the result.
+service ExpertCompute {
+    // Compute sparse expert FFN for a single layer
+    rpc ComputeExperts(ExpertRequest) returns (ExpertResponse);
+
+    // Compute shared expert FFN for a single layer
+    rpc ComputeSharedExperts(SharedExpertRequest) returns (ExpertResponse);
+
+    // Combined: compute both expert and shared FFN in one call (reduces round trips)
+    rpc ComputeLayer(LayerExpertRequest) returns (ExpertResponse);
+
+    // Health check
+    rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message ExpertRequest {
+    uint32 layer = 1;
+    // Hidden state tensor, flattened to f32 bytes
+    // Shape: [batch * seq_len, hidden_dim]
+    bytes hidden_state = 2;
+    uint32 batch_size = 3;
+    uint32 seq_len = 4;
+    uint32 hidden_dim = 5;
+    // Top-k expert indices per token: [batch * seq_len, k]
+    repeated uint32 expert_indices = 6;
+    // Top-k expert weights per token: [batch * seq_len, k]
+    repeated float expert_weights = 7;
+    uint32 k = 8; // number of experts per token
+}
+
+message SharedExpertRequest {
+    uint32 layer = 1;
+    bytes hidden_state = 2;
+    uint32 batch_size = 3;
+    uint32 seq_len = 4;
+    uint32 hidden_dim = 5;
+}
+
+message LayerExpertRequest {
+    uint32 layer = 1;
+    bytes hidden_state = 2;
+    uint32 batch_size = 3;
+    uint32 seq_len = 4;
+    uint32 hidden_dim = 5;
+    repeated uint32 expert_indices = 6;
+    repeated float expert_weights = 7;
+    uint32 k = 8;
+}
+
+message ExpertResponse {
+    // Output tensor, flattened f32 bytes
+    // Shape: [batch * seq_len, hidden_dim]
+    bytes output = 1;
+    // Timing info (microseconds)
+    uint64 compute_us = 2;
+    uint64 total_us = 3;
+}
+
+message PingRequest {}
+
+message PingResponse {
+    string device_name = 1;
+    uint32 n_layers = 2;
+    uint64 expert_memory_mb = 3;
+}

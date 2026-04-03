@@ -403,6 +403,111 @@ pub fn forward(
     Ok(logits)
 }
 
+// ── Split forward pass (expert FFN on remote device) ────────────
+
+/// Forward pass with expert FFN offloaded to remote gRPC server.
+/// SSM/attention/router run locally (fast GPU), experts run remotely (big memory).
+pub async fn forward_layer_split(
+    x: &Tensor,
+    model: &LoadedModel,
+    layer: u32,
+    kv_cache: &mut KvCache,
+    remote: &mut crate::expert_client::RemoteExpertClient,
+) -> Result<Tensor> {
+    let prefix = format!("blk.{}", layer);
+    let is_attn = is_attention_layer(layer);
+
+    // LOCAL: Pre-norm
+    let norm_w = model.tensor(&format!("{}.attn_norm.weight", prefix))
+        .ok_or_else(|| anyhow::anyhow!("Missing attn_norm for layer {}", layer))?;
+    let norm_w_f = norm_w.dequantize(x.device())?;
+    let normed = rms_norm(x, &norm_w_f, model.rms_norm_eps)?;
+
+    // LOCAL: Attention or SSM
+    let block_out = if is_attn {
+        self_attention(&normed, model, layer, kv_cache)?
+    } else {
+        ssm_block(&normed, model, layer)?
+    };
+    let x = (x + block_out)?;
+
+    // LOCAL: Post-norm
+    let post_norm_w = model.tensor(&format!("{}.post_attention_norm.weight", prefix))
+        .ok_or_else(|| anyhow::anyhow!("Missing post_attn_norm for layer {}", layer))?;
+    let post_norm_f = post_norm_w.dequantize(x.device())?;
+    let normed = rms_norm(&x, &post_norm_f, model.rms_norm_eps)?;
+
+    // LOCAL: MoE routing (compute which experts to activate)
+    let gate_w = make_qmatmul(model, &format!("{}.ffn_gate_inp.weight", prefix))?;
+    let (expert_indices, expert_weights) = moe_route(&normed, &gate_w, model.n_experts_used)?;
+
+    // REMOTE: Expert FFN + shared FFN on big memory device
+    let ffn_out = remote.compute_layer(
+        layer,
+        &normed,
+        &expert_indices,
+        &expert_weights,
+        model.n_experts_used,
+    ).await?;
+
+    // LOCAL: Residual
+    Ok((x + ffn_out)?)
+}
+
+/// Full forward pass with split execution
+pub async fn forward_split(
+    token_ids: &[u32],
+    model: &LoadedModel,
+    kv_caches: &mut Vec<KvCache>,
+    remote: &mut crate::expert_client::RemoteExpertClient,
+) -> Result<Tensor> {
+    let device = candle_core::Device::Cpu;
+    let seq_len = token_ids.len();
+
+    // Embedding lookup (on fast GPU — replicated tensor)
+    let embd = model.tensor("token_embd.weight")
+        .ok_or_else(|| anyhow::anyhow!("Missing token_embd"))?;
+    let embd_f = embd.dequantize(&device)?;
+    let indices = Tensor::from_vec(
+        token_ids.to_vec(),
+        (seq_len,),
+        &device,
+    )?;
+    let x = embd_f.index_select(&indices, 0)?.unsqueeze(0)?;
+
+    // Forward through all layers (split: local SSM/attn + remote experts)
+    let mut x = x;
+    let total_start = std::time::Instant::now();
+
+    for layer in 0..model.n_layers {
+        let layer_start = std::time::Instant::now();
+        x = forward_layer_split(&x, model, layer, &mut kv_caches[layer as usize], remote).await?;
+
+        if layer % 10 == 0 || layer == model.n_layers - 1 {
+            tracing::info!(
+                layer,
+                elapsed_ms = layer_start.elapsed().as_millis(),
+                "Layer complete"
+            );
+        }
+    }
+
+    tracing::info!(
+        total_ms = total_start.elapsed().as_millis(),
+        "All layers complete"
+    );
+
+    // Output norm + logits (on fast GPU)
+    let out_norm = model.tensor("output_norm.weight")
+        .ok_or_else(|| anyhow::anyhow!("Missing output_norm"))?;
+    let out_norm_f = out_norm.dequantize(&device)?;
+    let x = rms_norm(&x, &out_norm_f, model.rms_norm_eps)?;
+    let out_w = make_qmatmul(model, "output.weight")?;
+    let logits = out_w.forward(&x)?;
+
+    Ok(logits)
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn make_qmatmul(model: &LoadedModel, name: &str) -> Result<QMatMul> {
