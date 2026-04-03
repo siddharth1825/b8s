@@ -11,9 +11,9 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 memmap2 = "0.9"
-candle-core = "0.10"
-candle-nn = "0.10"
-candle-transformers = "0.10"
+candle-core = { version = "0.10", features = ["metal", "accelerate"] }
+candle-nn = { version = "0.10", features = ["metal", "accelerate"] }
+candle-transformers = { version = "0.10", features = ["metal", "accelerate"] }
 half = "2"
 tonic = "0.12"
 prost = "0.13"

@@ -32,15 +32,35 @@ pub struct LoadedModel {
     pub n_kv_heads: u32,
     pub head_dim: u32,
     pub rms_norm_eps: f32,
+    pub device: Device,
     pub vocab_size: u32,
 }
 
 impl LoadedModel {
-    /// Load a GGUF model, categorizing tensors by device placement.
-    /// All tensors are loaded onto the CPU initially — device transfer happens at inference time.
+    /// Load a GGUF model with auto-detected device (Metal if available, else CPU).
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let device = Self::best_device();
+        Self::load_with_device(path, &device)
+    }
+
+    /// Detect the best available device
+    pub fn best_device() -> Device {
+        match Device::new_metal(0) {
+            Ok(d) => {
+                tracing::info!("Using Metal GPU device");
+                d
+            }
+            Err(_) => {
+                tracing::info!("Metal not available, using CPU");
+                Device::Cpu
+            }
+        }
+    }
+
+    /// Load a GGUF model onto a specific device, categorizing tensors by placement.
+    pub fn load_with_device(path: impl AsRef<Path>, device: &Device) -> Result<Self> {
         let path = path.as_ref();
-        tracing::info!(path = %path.display(), "Loading GGUF model");
+        tracing::info!(path = %path.display(), device = ?device, "Loading GGUF model");
 
         // Use our parser for metadata + categorization
         let our_gguf = crate::gguf::GgufFile::open(path)?;
@@ -81,8 +101,6 @@ impl LoadedModel {
         let content = gguf_file::Content::read(&mut file)
             .context("Failed to parse GGUF with candle")?;
 
-        let device = Device::Cpu;
-
         // Build placement lookup from our categorization
         let placement_map: HashMap<String, DevicePlacement> = categories
             .iter()
@@ -102,7 +120,7 @@ impl LoadedModel {
             }
 
             let tensor = content
-                .tensor(&mut file, name, &device)
+                .tensor(&mut file, name, device)
                 .with_context(|| format!("Failed to load tensor: {}", name))?;
 
             let placement = placement_map
@@ -139,6 +157,7 @@ impl LoadedModel {
             head_dim,
             rms_norm_eps,
             vocab_size,
+            device: device.clone(),
         })
     }
 

@@ -76,6 +76,17 @@ enum Commands {
         #[arg(long)]
         load: bool,
     },
+    /// Benchmark inference: local-only and split modes
+    Bench {
+        /// Path to GGUF model file
+        model: String,
+        /// Expert worker gRPC address (for split mode)
+        #[arg(long)]
+        expert_addr: Option<String>,
+        /// Number of tokens to generate for benchmark
+        #[arg(long, default_value = "5")]
+        n_tokens: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -145,6 +156,7 @@ async fn main() -> Result<()> {
         }
         Commands::Top => tui::run(&cli.server).await?,
         Commands::Analyze { model, load } => analyze_model(&model, load)?,
+        Commands::Bench { model, expert_addr, n_tokens } => bench_inference(&model, expert_addr.as_deref(), n_tokens).await?,
     }
 
     Ok(())
@@ -265,6 +277,118 @@ fn analyze_model(path: &str, load_tensors: bool) -> Result<()> {
         let sample = output.flatten_all()?.narrow(0, 0, 5)?.to_vec1::<f32>()?;
         println!("Output sample: {:?}", sample);
         println!("\nPhase 2 forward pass working!");
+    }
+
+    Ok(())
+}
+
+async fn bench_inference(model_path: &str, expert_addr: Option<&str>, n_tokens: usize) -> Result<()> {
+    use llamactl_engine::{LoadedModel, inference};
+    use std::time::Instant;
+
+    println!("=== llamactl inference benchmark ===\n");
+    println!("Model: {}", model_path);
+
+    // Load model
+    let load_start = Instant::now();
+    let model = LoadedModel::load(model_path)?;
+    let load_time = load_start.elapsed();
+    println!("Device: {:?}", model.device);
+    println!("Loaded in {:.2}s", load_time.as_secs_f64());
+    println!("{}", model.memory_summary());
+    println!("Config: {} layers, {} experts ({} active), emb={}\n",
+        model.n_layers, model.n_experts, model.n_experts_used, model.embedding_dim);
+
+    // Dummy token IDs for benchmark (just use token 1 repeated)
+    let token_ids: Vec<u32> = vec![1];
+
+    // ── Test 1: Local-only baseline ─────────────────────────────
+    println!("--- Test 1: Local-only forward pass (all on this device) ---\n");
+    {
+        let mut kv_caches: Vec<inference::KvCache> = (0..model.n_layers)
+            .map(|_| inference::KvCache::new())
+            .collect();
+
+        // Warm up
+        println!("Warming up (1 token)...");
+        let _ = inference::forward(&token_ids, &model, &mut kv_caches);
+
+        // Reset caches
+        kv_caches = (0..model.n_layers)
+            .map(|_| inference::KvCache::new())
+            .collect();
+
+        // Benchmark
+        println!("Running {} token(s)...", n_tokens);
+        let mut total_time = std::time::Duration::ZERO;
+
+        for i in 0..n_tokens {
+            let start = Instant::now();
+            let logits = inference::forward(&token_ids, &model, &mut kv_caches)?;
+            let elapsed = start.elapsed();
+            total_time += elapsed;
+
+            let logits_shape = logits.shape().clone();
+            println!("  Token {}: {:.1}ms (logits shape: {:?})", i + 1, elapsed.as_millis(), logits_shape);
+        }
+
+        let avg_ms = total_time.as_millis() as f64 / n_tokens as f64;
+        let tok_per_sec = 1000.0 / avg_ms;
+        println!("\nLocal-only: {:.1} ms/token, {:.2} tok/s\n", avg_ms, tok_per_sec);
+    }
+
+    // ── Test 2: Split forward pass (if expert worker address provided) ──
+    if let Some(addr) = expert_addr {
+        println!("--- Test 2: Split forward pass (experts on remote worker) ---\n");
+        println!("Expert worker: {}", addr);
+
+        let mut remote = llamactl_engine::expert_client::RemoteExpertClient::connect(addr).await
+            .context("Failed to connect to expert worker")?;
+        println!("Connected to expert worker\n");
+
+        let mut kv_caches: Vec<inference::KvCache> = (0..model.n_layers)
+            .map(|_| inference::KvCache::new())
+            .collect();
+
+        // Warm up
+        println!("Warming up (1 token)...");
+        let _ = inference::forward_split(&token_ids, &model, &mut kv_caches, &mut remote).await;
+        remote.clear_timings();
+
+        // Reset
+        kv_caches = (0..model.n_layers)
+            .map(|_| inference::KvCache::new())
+            .collect();
+
+        // Benchmark
+        println!("Running {} token(s)...", n_tokens);
+        let mut total_time = std::time::Duration::ZERO;
+
+        for i in 0..n_tokens {
+            remote.clear_timings();
+            let start = Instant::now();
+            let logits = inference::forward_split(&token_ids, &model, &mut kv_caches, &mut remote).await?;
+            let elapsed = start.elapsed();
+            total_time += elapsed;
+
+            let logits_shape = logits.shape().clone();
+            println!("  Token {}: {:.1}ms (logits: {:?})", i + 1, elapsed.as_millis(), logits_shape);
+            println!("    Remote hops: {}", remote.timing_summary());
+        }
+
+        let avg_ms = total_time.as_millis() as f64 / n_tokens as f64;
+        let tok_per_sec = 1000.0 / avg_ms;
+        println!("\nSplit: {:.1} ms/token, {:.2} tok/s\n", avg_ms, tok_per_sec);
+
+        // Summary
+        println!("=== Comparison ===");
+        println!("  This measures operation-level split overhead.");
+        println!("  For fair comparison with llama.cpp RPC, both should use GPU.");
+        println!("  llamactl split sends ~8KB/layer vs llama.cpp RPC ~MB/layer.");
+    } else {
+        println!("--- Skipping split test (no --expert-addr provided) ---");
+        println!("  To test split: run expert-worker on another machine, then:");
+        println!("  llamactl bench --model <path> --expert-addr http://<ip>:50100");
     }
 
     Ok(())

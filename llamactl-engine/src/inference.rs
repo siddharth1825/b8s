@@ -367,7 +367,7 @@ pub fn forward(
     model: &LoadedModel,
     kv_caches: &mut Vec<KvCache>,
 ) -> Result<Tensor> {
-    let device = candle_core::Device::Cpu;
+    let device = &model.device;
     let seq_len = token_ids.len();
 
     // Embedding lookup
@@ -461,7 +461,7 @@ pub async fn forward_split(
     kv_caches: &mut Vec<KvCache>,
     remote: &mut crate::expert_client::RemoteExpertClient,
 ) -> Result<Tensor> {
-    let device = candle_core::Device::Cpu;
+    let device = &model.device;
     let seq_len = token_ids.len();
 
     // Embedding lookup (on fast GPU — replicated tensor)
