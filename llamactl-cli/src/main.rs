@@ -86,6 +86,9 @@ enum Commands {
         /// Number of tokens to generate for benchmark
         #[arg(long, default_value = "5")]
         n_tokens: usize,
+        /// Force CPU (avoids OOM when full model doesn't fit in GPU memory)
+        #[arg(long)]
+        cpu: bool,
     },
 }
 
@@ -156,7 +159,7 @@ async fn main() -> Result<()> {
         }
         Commands::Top => tui::run(&cli.server).await?,
         Commands::Analyze { model, load } => analyze_model(&model, load)?,
-        Commands::Bench { model, expert_addr, n_tokens } => bench_inference(&model, expert_addr.as_deref(), n_tokens).await?,
+        Commands::Bench { model, expert_addr, n_tokens, cpu } => bench_inference(&model, expert_addr.as_deref(), n_tokens, cpu).await?,
     }
 
     Ok(())
@@ -282,16 +285,27 @@ fn analyze_model(path: &str, load_tensors: bool) -> Result<()> {
     Ok(())
 }
 
-async fn bench_inference(model_path: &str, expert_addr: Option<&str>, n_tokens: usize) -> Result<()> {
+async fn bench_inference(model_path: &str, expert_addr: Option<&str>, n_tokens: usize, force_cpu: bool) -> Result<()> {
     use llamactl_engine::{LoadedModel, inference};
     use std::time::Instant;
 
     println!("=== llamactl inference benchmark ===\n");
     println!("Model: {}", model_path);
 
-    // Load model
+    // Load model — use Metal for split mode (only 1.3GB on GPU), CPU for local-only
     let load_start = Instant::now();
-    let model = LoadedModel::load(model_path)?;
+    let device = if force_cpu {
+        candle_core::Device::Cpu
+    } else if expert_addr.is_some() {
+        // Split mode: only ~1.3GB goes on Metal (FastGpu + Replicated)
+        LoadedModel::best_device()
+    } else {
+        // Local-only: full 15GB model, use CPU to avoid OOM
+        println!("Note: using CPU for local-only (full model too large for Metal)");
+        println!("  For GPU benchmark, use --expert-addr to split experts to another device\n");
+        candle_core::Device::Cpu
+    };
+    let model = LoadedModel::load_with_device(model_path, &device)?;
     let load_time = load_start.elapsed();
     println!("Device: {:?}", model.device);
     println!("Loaded in {:.2}s", load_time.as_secs_f64());
