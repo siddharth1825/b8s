@@ -52,8 +52,8 @@ impl RemoteExpertClient {
         // Serialize tensors
         let ser_start = Instant::now();
         let hidden_bytes = tensor_to_bytes(hidden_state)?;
-        let indices_flat = expert_indices.to_dtype(DType::U32)?.flatten_all()?.to_vec1::<u32>()?;
-        let weights_flat = expert_weights.flatten_all()?.to_vec1::<f32>()?;
+        let indices_flat = expert_indices.to_device(&candle_core::Device::Cpu)?.to_dtype(DType::U32)?.flatten_all()?.to_vec1::<u32>()?;
+        let weights_flat = expert_weights.to_device(&candle_core::Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
         let serialize_us = ser_start.elapsed().as_micros() as u64;
 
         // gRPC call

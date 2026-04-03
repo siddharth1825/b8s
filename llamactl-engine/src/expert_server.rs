@@ -165,7 +165,7 @@ fn compute_expert_ffn(model: &LoadedModel, req: &ExpertRequest) -> anyhow::Resul
 // ── Tensor serialization ────────────────────────────────────────
 
 pub fn tensor_to_bytes(t: &Tensor) -> anyhow::Result<Vec<u8>> {
-    let t = t.to_dtype(DType::F32)?;
+    let t = t.to_device(&candle_core::Device::Cpu)?.to_dtype(DType::F32)?;
     let data = t.flatten_all()?.to_vec1::<f32>()?;
     let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
     Ok(bytes)

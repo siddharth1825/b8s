@@ -450,6 +450,9 @@ pub async fn forward_layer_split(
         model.n_experts_used,
     ).await?;
 
+    // Move remote result to local device before residual add
+    let ffn_out = ffn_out.to_device(x.device())?;
+
     // LOCAL: Residual
     Ok((x + ffn_out)?)
 }
