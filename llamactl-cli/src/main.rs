@@ -292,20 +292,20 @@ async fn bench_inference(model_path: &str, expert_addr: Option<&str>, n_tokens: 
     println!("=== llamactl inference benchmark ===\n");
     println!("Model: {}", model_path);
 
-    // Load model — use Metal for split mode (only 1.3GB on GPU), CPU for local-only
     let load_start = Instant::now();
-    let device = if force_cpu {
-        candle_core::Device::Cpu
-    } else if expert_addr.is_some() {
-        // Split mode: only ~1.3GB goes on Metal (FastGpu + Replicated)
-        LoadedModel::best_device()
+    let model = if expert_addr.is_some() && !force_cpu {
+        // Split mode: only load FastGpu + Replicated onto Metal (~1.3 GB)
+        // Expert weights stay on the remote worker
+        println!("Split mode: loading only local tensors (FastGpu + Replicated) onto Metal GPU\n");
+        LoadedModel::load_split_local(model_path)?
     } else {
-        // Local-only: full 15GB model, use CPU to avoid OOM
-        println!("Note: using CPU for local-only (full model too large for Metal)");
-        println!("  For GPU benchmark, use --expert-addr to split experts to another device\n");
-        candle_core::Device::Cpu
+        // Local-only: full model on CPU (too large for Metal)
+        if !force_cpu {
+            println!("Note: using CPU for local-only (full model too large for Metal)");
+            println!("  For GPU benchmark, use --expert-addr to split experts to another device\n");
+        }
+        LoadedModel::load_with_device(model_path, &candle_core::Device::Cpu)?
     };
-    let model = LoadedModel::load_with_device(model_path, &device)?;
     let load_time = load_start.elapsed();
     println!("Device: {:?}", model.device);
     println!("Loaded in {:.2}s", load_time.as_secs_f64());
@@ -316,7 +316,8 @@ async fn bench_inference(model_path: &str, expert_addr: Option<&str>, n_tokens: 
     // Dummy token IDs for benchmark (just use token 1 repeated)
     let token_ids: Vec<u32> = vec![1];
 
-    // ── Test 1: Local-only baseline ─────────────────────────────
+    // ── Test 1: Local-only baseline (skip if split mode — no expert weights loaded)
+    if expert_addr.is_none() {
     println!("--- Test 1: Local-only forward pass (all on this device) ---\n");
     {
         let mut kv_caches: Vec<inference::KvCache> = (0..model.n_layers)
@@ -350,6 +351,7 @@ async fn bench_inference(model_path: &str, expert_addr: Option<&str>, n_tokens: 
         let tok_per_sec = 1000.0 / avg_ms;
         println!("\nLocal-only: {:.1} ms/token, {:.2} tok/s\n", avg_ms, tok_per_sec);
     }
+    } // end if expert_addr.is_none()
 
     // ── Test 2: Split forward pass (if expert worker address provided) ──
     if let Some(addr) = expert_addr {
