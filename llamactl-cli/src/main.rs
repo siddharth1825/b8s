@@ -72,6 +72,9 @@ enum Commands {
     Analyze {
         /// Path to GGUF model file
         model: String,
+        /// Actually load all tensors and test a single forward pass
+        #[arg(long)]
+        load: bool,
     },
 }
 
@@ -141,13 +144,13 @@ async fn main() -> Result<()> {
             println!("Node {} removed.", &node_id.to_string()[..8]);
         }
         Commands::Top => tui::run(&cli.server).await?,
-        Commands::Analyze { model } => analyze_model(&model)?,
+        Commands::Analyze { model, load } => analyze_model(&model, load)?,
     }
 
     Ok(())
 }
 
-fn analyze_model(path: &str) -> Result<()> {
+fn analyze_model(path: &str, load_tensors: bool) -> Result<()> {
     use llamactl_engine::{categorize_tensors, GgufFile, InferenceDag, TensorCategory, DevicePlacement};
     use std::collections::HashMap;
 
@@ -231,6 +234,37 @@ fn analyze_model(path: &str) -> Result<()> {
         let big_fit = if big_mb < vram_mb { "OK" } else { "TOO BIG" };
         println!("  {} as fast GPU: {:.0}/{:.0} MB [{}]", name, fast_mb, vram_mb, fast_fit);
         println!("  {} as big memory: {:.0}/{:.0} MB [{}]", name, big_mb, vram_mb, big_fit);
+    }
+
+    if load_tensors {
+        println!("\n--- Loading tensors into memory ---\n");
+        let start = std::time::Instant::now();
+        let model = llamactl_engine::LoadedModel::load(path)?;
+        let elapsed = start.elapsed();
+        println!("Loaded in {:.2}s", elapsed.as_secs_f64());
+        println!("{}", model.memory_summary());
+        println!("\nModel config: {} layers, {} heads ({} KV), head_dim={}, vocab={}",
+            model.n_layers, model.n_heads, model.n_kv_heads, model.head_dim, model.vocab_size);
+
+        // Test single token forward pass through layer 0
+        println!("\n--- Testing forward pass (layer 0) ---\n");
+        let device = candle_core::Device::Cpu;
+        let hidden = model.embedding_dim as usize;
+
+        // Create a random input (simulating embedding output)
+        let x = candle_core::Tensor::randn(0f32, 1.0, (1, 1, hidden), &device)?;
+        println!("Input shape: {:?}", x.shape());
+
+        let mut kv_cache = llamactl_engine::inference::KvCache::new();
+        let start = std::time::Instant::now();
+        let output = llamactl_engine::inference::forward_layer(&x, &model, 0, &mut kv_cache, true)?;
+        let elapsed = start.elapsed();
+
+        println!("Output shape: {:?}", output.shape());
+        println!("Layer 0 forward pass: {:.2}ms", elapsed.as_millis());
+        let sample = output.flatten_all()?.narrow(0, 0, 5)?.to_vec1::<f32>()?;
+        println!("Output sample: {:?}", sample);
+        println!("\nPhase 2 forward pass working!");
     }
 
     Ok(())

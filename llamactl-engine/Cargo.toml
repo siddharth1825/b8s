@@ -10,3 +10,7 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 memmap2 = "0.9"
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
+half = "2"
