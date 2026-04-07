@@ -76,6 +76,14 @@ enum Commands {
         #[arg(long)]
         load: bool,
     },
+    /// Repack GGUF expert tensors into per-layer files for SSD streaming
+    Repack {
+        /// Path to GGUF model file
+        model: String,
+        /// Output directory (default: <model_dir>/packed_experts/)
+        #[arg(long, short)]
+        output: Option<String>,
+    },
     /// Benchmark inference: local-only and split modes
     Bench {
         /// Path to GGUF model file
@@ -159,6 +167,7 @@ async fn main() -> Result<()> {
         }
         Commands::Top => tui::run(&cli.server).await?,
         Commands::Analyze { model, load } => analyze_model(&model, load)?,
+        Commands::Repack { model, output } => repack_experts(&model, output.as_deref())?,
         Commands::Bench { model, expert_addr, n_tokens, cpu } => bench_inference(&model, expert_addr.as_deref(), n_tokens, cpu).await?,
     }
 
@@ -251,6 +260,169 @@ fn analyze_model(path: &str, load_tensors: bool) -> Result<()> {
         println!("  {} as big memory: {:.0}/{:.0} MB [{}]", name, big_mb, vram_mb, big_fit);
     }
 
+    // ── Expert router analysis ──────────────────────────────────
+    // Analyze router gate weights to understand expert selection patterns
+    {
+        let n_layers = gguf.n_layers().unwrap_or(0) as usize;
+        let n_experts = gguf.n_experts().unwrap_or(0) as usize;
+        let emb_dim = gguf.embedding_dim().unwrap_or(0) as usize;
+
+        if n_experts > 1 && emb_dim > 0 {
+            println!("\nExpert router analysis:");
+
+            // Per-expert stats across layers
+            let mut expert_total_norm = vec![0.0f64; n_experts];
+            let mut expert_max_norm = vec![0.0f64; n_experts];
+            let mut layers_analyzed = 0usize;
+
+            // Per-layer diversity (how spread out are expert norms)
+            let mut layer_diversity = Vec::new();
+
+            for layer in 0..n_layers {
+                let gate_name = format!("blk.{}.ffn_gate_inp.weight", layer);
+                let tensor = match gguf.find_tensor(&gate_name) {
+                    Some(t) => t,
+                    None => continue,
+                };
+
+                // Router gate is typically F32: [n_expert, n_embd] (GGUF dims reversed)
+                // For F32, we can read directly. For quantized, skip.
+                if tensor.dtype != llamactl_engine::gguf::GgmlType::F32 {
+                    if layer == 0 {
+                        println!("  Router gate is {:?} (not F32) — skipping detailed analysis", tensor.dtype);
+                    }
+                    continue;
+                }
+
+                let data = gguf.tensor_data(tensor);
+                let floats: &[f32] = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4)
+                };
+
+                // Compute L2 norm per expert row
+                // GGUF shape [n_embd, n_expert] but stored row-major as [n_expert, n_embd]
+                let mut expert_norms = vec![0.0f64; n_experts];
+                for e in 0..n_experts {
+                    let row_start = e * emb_dim;
+                    let row_end = row_start + emb_dim;
+                    if row_end > floats.len() { break; }
+                    let norm: f64 = floats[row_start..row_end]
+                        .iter()
+                        .map(|&x| (x as f64) * (x as f64))
+                        .sum::<f64>()
+                        .sqrt();
+                    expert_norms[e] = norm;
+                    expert_total_norm[e] += norm;
+                    if norm > expert_max_norm[e] {
+                        expert_max_norm[e] = norm;
+                    }
+                }
+
+                // Layer diversity: std dev of expert norms
+                let mean: f64 = expert_norms.iter().sum::<f64>() / n_experts as f64;
+                let var: f64 = expert_norms.iter().map(|n| (n - mean).powi(2)).sum::<f64>() / n_experts as f64;
+                layer_diversity.push((layer, mean, var.sqrt()));
+                layers_analyzed += 1;
+            }
+
+            if layers_analyzed > 0 {
+                // Average norm per expert across layers
+                let avg_norms: Vec<f64> = expert_total_norm.iter()
+                    .map(|n| n / layers_analyzed as f64)
+                    .collect();
+
+                // Find hottest and coldest experts
+                let mut indexed: Vec<(usize, f64)> = avg_norms.iter()
+                    .enumerate()
+                    .map(|(i, &n)| (i, n))
+                    .collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+                let global_mean = avg_norms.iter().sum::<f64>() / n_experts as f64;
+                let global_std = (avg_norms.iter().map(|n| (n - global_mean).powi(2)).sum::<f64>() / n_experts as f64).sqrt();
+
+                println!("  Layers analyzed: {} (F32 router gates)", layers_analyzed);
+                println!("  Expert routing weight norm (avg across layers):");
+                println!("    Mean:    {:.4}", global_mean);
+                println!("    Std dev: {:.4}  (higher = more expert specialization)", global_std);
+                println!("    CV:      {:.1}%  (coefficient of variation)", global_std / global_mean * 100.0);
+
+                println!("\n  All experts ranked by routing weight norm (descending):");
+                println!("    {:>7} {:>8} {:>7}", "EXPERT", "NORM", "SIGMA");
+                for &(idx, norm) in &indexed {
+                    let sigma = (norm - global_mean) / global_std;
+                    let marker = if sigma > 1.0 { " HOT" } else if sigma < -1.0 { " COLD" } else { "" };
+                    println!("    {:>7} {:>8.4} {:>+6.1}σ{}", idx, norm, sigma, marker);
+                }
+
+                // Expert similarity (cosine similarity between top experts)
+                // Check how many experts are "redundant"
+                let high_threshold = global_mean + global_std;
+                let low_threshold = global_mean - global_std;
+                let hot_count = avg_norms.iter().filter(|&&n| n > high_threshold).count();
+                let cold_count = avg_norms.iter().filter(|&&n| n < low_threshold).count();
+                let mid_count = n_experts - hot_count - cold_count;
+
+                println!("\n  Expert activity distribution:");
+                println!("    Hot  (>+1σ): {:>4} experts ({:.1}%) — frequently selected",
+                    hot_count, hot_count as f64 / n_experts as f64 * 100.0);
+                println!("    Mid  (±1σ):  {:>4} experts ({:.1}%) — average selection rate",
+                    mid_count, mid_count as f64 / n_experts as f64 * 100.0);
+                println!("    Cold (<-1σ): {:>4} experts ({:.1}%) — rarely selected",
+                    cold_count, cold_count as f64 / n_experts as f64 * 100.0);
+
+                // Layer diversity analysis
+                println!("\n  Layer-wise routing diversity (higher = more expert differentiation):");
+                let early = &layer_diversity[..std::cmp::min(5, layer_diversity.len())];
+                let late = &layer_diversity[layer_diversity.len().saturating_sub(5)..];
+                let early_std: f64 = early.iter().map(|(_, _, s)| s).sum::<f64>() / early.len() as f64;
+                let late_std: f64 = late.iter().map(|(_, _, s)| s).sum::<f64>() / late.len() as f64;
+                println!("    Early layers (0-4) avg std: {:.4}", early_std);
+                println!("    Late layers ({}-{}) avg std:  {:.4}",
+                    layer_diversity.len() - late.len(), layer_diversity.len() - 1, late_std);
+                if late_std > early_std * 1.2 {
+                    println!("    → Late layers have more specialized routing (typical)");
+                } else if early_std > late_std * 1.2 {
+                    println!("    → Early layers have more specialized routing (unusual)");
+                } else {
+                    println!("    → Routing specialization is uniform across layers");
+                }
+
+                // SSD streaming estimate
+                // Expert tensors are stacked: each tensor (gate_exps, up_exps, down_exps) contains
+                // all n_experts stacked along one dimension. A single expert needs 1/n_experts of each.
+                // There are 3 tensors per layer, so per-expert size = total_expert_MB / n_layers / n_experts
+                let n_experts_used = gguf.n_experts_used().unwrap_or(8) as usize;
+                let total_expert_mb = by_category.get(&TensorCategory::ExpertFfn)
+                    .map(|(_count, mb)| *mb)
+                    .unwrap_or(0.0);
+                let single_expert_mb = total_expert_mb / n_layers as f64 / n_experts as f64;
+
+                println!("\n  SSD streaming estimate (flash-expert mode):");
+                println!("    Single expert size: {:.2} MB (all 3 projections)", single_expert_mb);
+                println!("    Per-layer IO: {} experts × {:.2} MB = {:.1} MB",
+                    n_experts_used, single_expert_mb, n_experts_used as f64 * single_expert_mb);
+                let per_token_mb = n_layers as f64 * n_experts_used as f64 * single_expert_mb;
+                println!("    Per-token IO (cold): {:.0} MB across {} layers", per_token_mb, n_layers);
+
+                for (name, gbps) in [("Apple NVMe (M4 Pro)", 7.0), ("Windows NVMe (typical)", 3.5), ("SATA SSD", 0.5)] {
+                    let ms = per_token_mb / (gbps * 1024.0) * 1000.0;
+                    println!("    {} @ {} GB/s: {:.0} ms/token (cold), ~{:.1} tok/s max",
+                        name, gbps, ms, 1000.0 / ms);
+                }
+
+                // Page cache estimate
+                println!("\n    With OS page cache (~70% hit rate):");
+                let cached_per_token_mb = per_token_mb * 0.3; // only 30% are cache misses
+                for (name, gbps) in [("Apple NVMe (M4 Pro)", 7.0), ("Windows NVMe (typical)", 3.5)] {
+                    let ms = cached_per_token_mb / (gbps * 1024.0) * 1000.0;
+                    println!("    {} @ {} GB/s: {:.0} ms/token, ~{:.1} tok/s",
+                        name, gbps, ms, 1000.0 / ms);
+                }
+            }
+        }
+    }
+
     if load_tensors {
         println!("\n--- Loading tensors into memory ---\n");
         let start = std::time::Instant::now();
@@ -281,6 +453,231 @@ fn analyze_model(path: &str, load_tensors: bool) -> Result<()> {
         println!("Output sample: {:?}", sample);
         println!("\nPhase 2 forward pass working!");
     }
+
+    Ok(())
+}
+
+fn repack_experts(model_path: &str, output_dir: Option<&str>) -> Result<()> {
+    use llamactl_engine::GgufFile;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    println!("=== llamactl repack — GGUF expert repacker ===\n");
+
+    let gguf = GgufFile::open(model_path)?;
+
+    let n_layers = gguf.n_layers().context("Model has no layer count")? as usize;
+    let n_experts = gguf.n_experts().context("Model has no expert count (not a MoE model?)")? as usize;
+    let n_experts_used = gguf.n_experts_used().unwrap_or(8) as usize;
+    let arch = gguf.architecture().unwrap_or("unknown").to_string();
+    let model_name = gguf.model_name().unwrap_or("unknown").to_string();
+
+    println!("Model:    {} ({})", model_name, arch);
+    println!("Layers:   {}", n_layers);
+    println!("Experts:  {} ({} active/token)\n", n_experts, n_experts_used);
+
+    // Determine output directory
+    let out_dir = match output_dir {
+        Some(d) => PathBuf::from(d),
+        None => {
+            let model_dir = std::path::Path::new(model_path)
+                .parent()
+                .unwrap_or(std::path::Path::new("."));
+            let model_stem = std::path::Path::new(model_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model");
+            model_dir.join(format!("{}.experts", model_stem))
+        }
+    };
+    std::fs::create_dir_all(&out_dir)?;
+    println!("Output:   {}\n", out_dir.display());
+
+    // Find expert tensor patterns per layer
+    // Expert tensors follow: blk.{layer}.ffn_{gate,up,down}_exps.weight
+    // or fused: blk.{layer}.ffn_gate_up_exps.weight
+    // Also shared: blk.{layer}.ffn_{gate,up,down}_shexp.weight
+    let expert_patterns = &[
+        "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", "ffn_gate_up_exps",
+    ];
+    let shared_patterns = &[
+        "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp", "ffn_gate_inp_shexp",
+    ];
+
+    // Discover which expert tensors exist in layer 0 to determine the layout
+    let mut expert_tensor_names: Vec<String> = Vec::new();
+    let mut shared_tensor_names: Vec<String> = Vec::new();
+
+    for pattern in expert_patterns {
+        let name = format!("blk.0.{}.weight", pattern);
+        if gguf.find_tensor(&name).is_some() {
+            expert_tensor_names.push(pattern.to_string());
+        }
+    }
+    for pattern in shared_patterns {
+        let name = format!("blk.0.{}.weight", pattern);
+        if gguf.find_tensor(&name).is_some() {
+            shared_tensor_names.push(pattern.to_string());
+        }
+    }
+
+    println!("Expert tensors per layer: {:?}", expert_tensor_names);
+    println!("Shared tensors per layer: {:?}", shared_tensor_names);
+
+    // Calculate per-expert size from the stacked tensors
+    // Each expert tensor has shape [dim1, dim2, n_expert] — expert i is at offset i * (total / n_expert)
+    let mut per_expert_bytes: u64 = 0;
+    let mut tensor_layout: Vec<(String, u64)> = Vec::new(); // (name, per_expert_size)
+
+    for pattern in &expert_tensor_names {
+        let name = format!("blk.0.{}.weight", pattern);
+        let tensor = gguf.find_tensor(&name).unwrap();
+        // Use actual mmap'd data length, not calculated size_bytes (which can be imprecise for block quants)
+        let actual_bytes = gguf.tensor_data(tensor).len() as u64;
+        let expert_slice_bytes = actual_bytes / n_experts as u64;
+        per_expert_bytes += expert_slice_bytes;
+        tensor_layout.push((pattern.clone(), expert_slice_bytes));
+        println!("  {}: {:?} {:?} → {} bytes/expert (tensor total: {} bytes)",
+            pattern, tensor.shape, tensor.dtype, expert_slice_bytes, actual_bytes);
+    }
+
+    // Shared expert sizes (not per-expert, just one per layer)
+    let mut shared_bytes: u64 = 0;
+    let mut shared_layout: Vec<(String, u64)> = Vec::new();
+    for pattern in &shared_tensor_names {
+        let name = format!("blk.0.{}.weight", pattern);
+        let tensor = gguf.find_tensor(&name).unwrap();
+        let actual_bytes = gguf.tensor_data(tensor).len() as u64;
+        shared_bytes += actual_bytes;
+        shared_layout.push((pattern.clone(), actual_bytes));
+    }
+
+    println!("\n  Per-expert size: {} bytes ({:.2} MB)", per_expert_bytes, per_expert_bytes as f64 / 1024.0 / 1024.0);
+    println!("  Shared expert size: {} bytes ({:.2} MB)", shared_bytes, shared_bytes as f64 / 1024.0 / 1024.0);
+    let per_layer_bytes = n_experts as u64 * per_expert_bytes + shared_bytes;
+    let total_bytes = n_layers as u64 * per_layer_bytes;
+    println!("  Per-layer file size: {:.2} GB", per_layer_bytes as f64 / 1024.0 / 1024.0 / 1024.0);
+    println!("  Total repacked size: {:.2} GB\n", total_bytes as f64 / 1024.0 / 1024.0 / 1024.0);
+
+    // Write manifest
+    let manifest = serde_json::json!({
+        "model": model_name,
+        "architecture": arch,
+        "n_layers": n_layers,
+        "n_experts": n_experts,
+        "n_experts_used": n_experts_used,
+        "per_expert_bytes": per_expert_bytes,
+        "shared_bytes": shared_bytes,
+        "expert_layout": tensor_layout.iter().map(|(name, size)| {
+            serde_json::json!({"tensor": name, "bytes": size})
+        }).collect::<Vec<_>>(),
+        "shared_layout": shared_layout.iter().map(|(name, size)| {
+            serde_json::json!({"tensor": name, "bytes": size})
+        }).collect::<Vec<_>>(),
+    });
+    let manifest_path = out_dir.join("manifest.json");
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+    println!("Wrote {}", manifest_path.display());
+
+    // Repack each layer
+    // NOTE: Q3_K_M uses mixed quantization — different layers may use different quant types
+    // for the same tensor name. We compute per-expert sizes per layer, not just from layer 0.
+    let repack_start = std::time::Instant::now();
+
+    for layer in 0..n_layers {
+        let layer_start = std::time::Instant::now();
+        let layer_path = out_dir.join(format!("layer_{:03}.bin", layer));
+
+        let mut layer_file = std::fs::File::create(&layer_path)?;
+
+        // Compute per-expert slice sizes for THIS layer's tensors
+        let mut layer_expert_layout: Vec<(&str, u64)> = Vec::new();
+        for pattern in &expert_tensor_names {
+            let tensor_name = format!("blk.{}.{}.weight", layer, pattern);
+            let tensor = gguf.find_tensor(&tensor_name)
+                .with_context(|| format!("Missing tensor: {}", tensor_name))?;
+            let actual_bytes = gguf.tensor_data(tensor).len() as u64;
+            let expert_slice = actual_bytes / n_experts as u64;
+            layer_expert_layout.push((pattern, expert_slice));
+        }
+
+        // Write expert data: expert 0 components, expert 1 components, ..., expert N components
+        for expert_idx in 0..n_experts {
+            for &(pattern, expert_slice_bytes) in &layer_expert_layout {
+                let tensor_name = format!("blk.{}.{}.weight", layer, pattern);
+                let tensor = gguf.find_tensor(&tensor_name).unwrap();
+                let all_data = gguf.tensor_data(tensor);
+                let start = expert_idx as u64 * expert_slice_bytes;
+                let end = start + expert_slice_bytes;
+                layer_file.write_all(&all_data[start as usize..end as usize])?;
+            }
+        }
+
+        // Write shared expert data at the end of the file
+        for (pattern, _) in &shared_layout {
+            let tensor_name = format!("blk.{}.{}.weight", layer, pattern);
+            let tensor = gguf.find_tensor(&tensor_name)
+                .with_context(|| format!("Missing tensor: {}", tensor_name))?;
+            let data = gguf.tensor_data(tensor);
+            layer_file.write_all(data)?;
+        }
+
+        // Also compute shared expert sizes for this layer
+        let mut layer_shared_layout: Vec<(&str, u64)> = Vec::new();
+        for (pattern, _) in &shared_layout {
+            let tensor_name = format!("blk.{}.{}.weight", layer, pattern);
+            let tensor = gguf.find_tensor(&tensor_name)
+                .with_context(|| format!("Missing tensor: {}", tensor_name))?;
+            layer_shared_layout.push((pattern, gguf.tensor_data(tensor).len() as u64));
+        }
+
+        // Write per-layer metadata
+        let layer_meta = serde_json::json!({
+            "layer": layer,
+            "per_expert_bytes": layer_expert_layout.iter().map(|(_, s)| s).sum::<u64>(),
+            "expert_tensors": layer_expert_layout.iter().map(|(name, size)| {
+                serde_json::json!({"tensor": name, "bytes": size})
+            }).collect::<Vec<_>>(),
+            "shared_tensors": layer_shared_layout.iter().map(|(name, size)| {
+                serde_json::json!({"tensor": name, "bytes": size})
+            }).collect::<Vec<_>>(),
+            "shared_bytes": layer_shared_layout.iter().map(|(_, s)| s).sum::<u64>(),
+        });
+        let meta_path = out_dir.join(format!("layer_{:03}.json", layer));
+        std::fs::write(&meta_path, serde_json::to_string(&layer_meta)?)?;
+
+        layer_file.flush()?;
+        let elapsed = layer_start.elapsed();
+        let file_size = std::fs::metadata(&layer_path)?.len();
+        let throughput = file_size as f64 / elapsed.as_secs_f64() / 1024.0 / 1024.0 / 1024.0;
+
+        let total_elapsed = repack_start.elapsed();
+        let eta = if layer > 0 {
+            total_elapsed.as_secs_f64() / (layer as f64) * ((n_layers - layer - 1) as f64)
+        } else { 0.0 };
+
+        print!("\r  Layer {:>3}/{}: {:.2} GB in {:.1}s ({:.1} GB/s) | ETA: {:.0}s    ",
+            layer + 1, n_layers,
+            file_size as f64 / 1024.0 / 1024.0 / 1024.0,
+            elapsed.as_secs_f64(),
+            throughput,
+            eta);
+        std::io::stdout().flush()?;
+    }
+
+    let total_elapsed = repack_start.elapsed();
+    let total_written: u64 = (0..n_layers).map(|l| {
+        std::fs::metadata(out_dir.join(format!("layer_{:03}.bin", l)))
+            .map(|m| m.len()).unwrap_or(0)
+    }).sum();
+
+    println!("\n\nDone! Repacked {} layers in {:.1}s", n_layers, total_elapsed.as_secs_f64());
+    println!("  Total: {:.2} GB at {:.1} GB/s",
+        total_written as f64 / 1024.0 / 1024.0 / 1024.0,
+        total_written as f64 / total_elapsed.as_secs_f64() / 1024.0 / 1024.0 / 1024.0);
+    println!("  Output: {}", out_dir.display());
+    println!("\n  To use with flash-expert mode:");
+    println!("  llamactl serve --model {} --flash-expert {}", model_path, out_dir.display());
 
     Ok(())
 }

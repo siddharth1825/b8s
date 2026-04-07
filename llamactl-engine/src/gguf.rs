@@ -121,38 +121,68 @@ impl GgmlType {
         }
     }
 
-    /// Bits per element (approximate for block quantizations)
-    pub fn bits_per_element(&self) -> f64 {
+    /// Block size (number of elements per block) for quantized types
+    pub fn block_size(&self) -> u64 {
         match self {
-            Self::F32 => 32.0,
-            Self::F16 | Self::BF16 => 16.0,
-            Self::Q4_0 => 4.5,
-            Self::Q4_1 => 5.0,
-            Self::Q5_0 => 5.5,
-            Self::Q5_1 => 6.0,
-            Self::Q8_0 => 8.5,
-            Self::Q8_1 => 9.0,
-            Self::Q2K => 3.35,
-            Self::Q3K => 3.44,
-            Self::Q4K => 4.5,
-            Self::Q5K => 5.5,
-            Self::Q6K => 6.5,
-            Self::IQ2XXS => 2.06,
-            Self::IQ2XS => 2.31,
-            Self::IQ2S => 2.5,
-            Self::IQ3XXS => 3.06,
-            Self::IQ3S => 3.44,
-            Self::IQ1S => 1.56,
-            Self::IQ1M => 1.75,
-            Self::IQ4NL => 4.5,
-            Self::IQ4XS => 4.25,
-            Self::I8 => 8.0,
-            Self::I16 => 16.0,
-            Self::I32 => 32.0,
-            Self::I64 => 64.0,
-            Self::F64 => 64.0,
-            Self::Unknown(_) => 4.0,
+            Self::F32 | Self::F16 | Self::BF16 | Self::F64 => 1,
+            Self::I8 | Self::I16 | Self::I32 | Self::I64 => 1,
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 |
+            Self::Q8_0 | Self::Q8_1 | Self::IQ4NL => 32,
+            // K-quants use QK_K = 256
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => 256,
+            Self::IQ2XXS | Self::IQ2XS | Self::IQ2S | Self::IQ3XXS | Self::IQ3S |
+            Self::IQ1S | Self::IQ1M | Self::IQ4XS => 256,
+            Self::Unknown(_) => 32,
         }
+    }
+
+    /// Bytes per block (exact, matches GGML's sizeof(block_xxx))
+    pub fn type_size(&self) -> u64 {
+        match self {
+            Self::F32 => 4,
+            Self::F16 | Self::BF16 => 2,
+            Self::F64 => 8,
+            Self::I8 => 1,
+            Self::I16 => 2,
+            Self::I32 => 4,
+            Self::I64 => 8,
+            // Non-K quants (block_size=32)
+            Self::Q4_0 => 2 + 32 / 2,          // 18: half d + 16 bytes of nibbles
+            Self::Q4_1 => 2 + 2 + 32 / 2,      // 20: half d + half m + 16 bytes
+            Self::Q5_0 => 2 + 4 + 32 / 2,      // 22: half d + 4 bytes high bits + 16 bytes
+            Self::Q5_1 => 2 + 2 + 4 + 32 / 2,  // 24: half d + half m + 4 bytes + 16 bytes
+            Self::Q8_0 => 2 + 32,               // 34: half d + 32 bytes
+            Self::Q8_1 => 4 + 4 + 32,           // 40: float d + float s + 32 bytes
+            Self::IQ4NL => 2 + 16,              // 18: half d + 16 bytes
+            // K-quants (QK_K=256)
+            Self::Q2K => 256 / 16 + 256 / 4 + 2 + 2,  // 84: scales + qs + d + dmin
+            Self::Q3K => 256 / 4 + 256 / 8 + 12 + 2,  // 110: hmask + qs + scales + d
+            Self::Q4K => 2 + 2 + 12 + 256 / 2,         // 144: d + dmin + scales + qs
+            Self::Q5K => 2 + 2 + 12 + 256 / 2 + 256 / 8, // 176: d + dmin + scales + qs + qh
+            Self::Q6K => 256 / 2 + 256 / 4 + 256 / 16 + 2, // 210: ql + qh + scales + d
+            // IQ types (approximate — less common, using known sizes)
+            Self::IQ2XXS => 2 + 2 * 256 / 8,   // 66
+            Self::IQ2XS => 2 + 2 * 256 / 8 + 256 / 32, // 74
+            Self::IQ2S => 2 + 256 / 4 + 256 / 16, // 82
+            Self::IQ3XXS => 2 + 3 * 256 / 8,   // 98
+            Self::IQ3S => 2 + 256 / 4 + 256 / 8 + 256 / 32, // 110
+            Self::IQ1S => 2 + 256 / 8 + 256 / 16, // 50
+            Self::IQ1M => 256 / 8 + 256 / 16 + 256 / 32, // 56
+            Self::IQ4XS => 2 + 2 + 256 / 2,    // 132
+            Self::Unknown(_) => 18, // assume Q4_0-like
+        }
+    }
+
+    /// Exact byte count for n_elements of this type
+    pub fn nbytes(&self, n_elements: u64) -> u64 {
+        let bs = self.block_size();
+        let n_blocks = (n_elements + bs - 1) / bs;
+        n_blocks * self.type_size()
+    }
+
+    /// Bits per element (approximate, for display only)
+    pub fn bits_per_element(&self) -> f64 {
+        self.type_size() as f64 * 8.0 / self.block_size() as f64
     }
 }
 
@@ -229,7 +259,18 @@ impl GgufFile {
             let offset = read_u64(&mmap, &mut cursor);
 
             let n_elements: u64 = shape.iter().product();
-            let size_bytes = (n_elements as f64 * dtype.bits_per_element() / 8.0).ceil() as u64;
+            // For stacked tensors [d1, d2, n_expert], the innermost dims are
+            // contiguous blocks. Size = product(inner_dims) computed per-block,
+            // then multiplied by outermost dim.
+            // For simple tensors, this is just dtype.nbytes(n_elements).
+            let size_bytes = if shape.len() >= 2 {
+                // Inner elements = product of all dims except last
+                let inner: u64 = shape[..shape.len()-1].iter().product();
+                let outer = *shape.last().unwrap();
+                dtype.nbytes(inner) * outer
+            } else {
+                dtype.nbytes(n_elements)
+            };
 
             tensors.push(TensorInfo {
                 name,
@@ -303,6 +344,18 @@ impl GgufFile {
 
     pub fn total_size_mb(&self) -> f64 {
         self.tensors.iter().map(|t| t.size_mb()).sum()
+    }
+
+    /// Read raw bytes for a tensor from the mmap'd file.
+    pub fn tensor_data(&self, tensor: &TensorInfo) -> &[u8] {
+        let start = self.data_offset as usize + tensor.data_offset as usize;
+        let end = start + tensor.size_bytes as usize;
+        &self._mmap[start..end]
+    }
+
+    /// Find a tensor by name
+    pub fn find_tensor(&self, name: &str) -> Option<&TensorInfo> {
+        self.tensors.iter().find(|t| t.name == name)
     }
 }
 
