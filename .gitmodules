@@ -1,3 +1,0 @@
-[submodule "llama.cpp"]
-	path = llama.cpp
-	url = https://github.com/siddharth1825/llama.cpp-flash-expert.git
