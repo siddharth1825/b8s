@@ -84,6 +84,26 @@ enum Commands {
         #[arg(long, short)]
         output: Option<String>,
     },
+    /// Run inference on a model (auto-selects strategy based on hardware)
+    Serve {
+        /// Path to GGUF model file
+        model: String,
+        /// Port for the OpenAI-compatible API
+        #[arg(long, default_value = "8080")]
+        port: u16,
+        /// Context length
+        #[arg(long, short, default_value = "512")]
+        ctx: u32,
+        /// Number of hot experts to pin in RAM (0 = none, auto = based on available RAM)
+        #[arg(long, default_value = "0")]
+        pin_top: usize,
+        /// Force strategy: "auto", "full-ram", "flash-ssd"
+        #[arg(long, default_value = "auto")]
+        strategy: String,
+        /// Path to llama-server binary (auto-detected if not specified)
+        #[arg(long)]
+        llama_server: Option<String>,
+    },
     /// Benchmark inference: local-only and split modes
     Bench {
         /// Path to GGUF model file
@@ -168,6 +188,8 @@ async fn main() -> Result<()> {
         Commands::Top => tui::run(&cli.server).await?,
         Commands::Analyze { model, load } => analyze_model(&model, load)?,
         Commands::Repack { model, output } => repack_experts(&model, output.as_deref())?,
+        Commands::Serve { model, port, ctx, pin_top, strategy, llama_server } =>
+            serve_model(&model, port, ctx, pin_top, &strategy, llama_server.as_deref()).await?,
         Commands::Bench { model, expert_addr, n_tokens, cpu } => bench_inference(&model, expert_addr.as_deref(), n_tokens, cpu).await?,
     }
 
@@ -452,6 +474,269 @@ fn analyze_model(path: &str, load_tensors: bool) -> Result<()> {
         let sample = output.flatten_all()?.narrow(0, 0, 5)?.to_vec1::<f32>()?;
         println!("Output sample: {:?}", sample);
         println!("\nPhase 2 forward pass working!");
+    }
+
+    Ok(())
+}
+
+async fn serve_model(
+    model_path: &str,
+    port: u16,
+    ctx: u32,
+    pin_top: usize,
+    strategy: &str,
+    llama_server_path: Option<&str>,
+) -> Result<()> {
+    use llamactl_engine::{GgufFile, categorize_tensors, TensorCategory, DevicePlacement};
+    use std::collections::HashMap;
+    use std::process::Command;
+
+    println!("=== llamactl serve ===\n");
+
+    // Step 1: Analyze the model
+    let gguf = GgufFile::open(model_path)?;
+    let n_layers = gguf.n_layers().unwrap_or(0) as usize;
+    let n_experts = gguf.n_experts().unwrap_or(0) as usize;
+    let n_experts_used = gguf.n_experts_used().unwrap_or(0) as usize;
+    let model_name = gguf.model_name().unwrap_or("unknown").to_string();
+
+    let categorized = categorize_tensors(&gguf);
+    let mut by_placement: HashMap<DevicePlacement, f64> = HashMap::new();
+    for t in &categorized {
+        *by_placement.entry(t.placement).or_default() += t.size_bytes as f64 / (1024.0 * 1024.0);
+    }
+
+    let total_mb: f64 = categorized.iter().map(|t| t.size_bytes as f64 / (1024.0 * 1024.0)).sum();
+    let active_mb = by_placement.get(&DevicePlacement::FastGpu).unwrap_or(&0.0)
+        + by_placement.get(&DevicePlacement::Replicated).unwrap_or(&0.0);
+    let expert_mb = by_placement.get(&DevicePlacement::BigMemory).unwrap_or(&0.0);
+
+    println!("Model:    {} ({} layers, {} experts)", model_name, n_layers, n_experts);
+    println!("Size:     {:.1} GB total, {:.0} MB active, {:.0} MB experts ({:.0}%)",
+        total_mb / 1024.0, active_mb, expert_mb, expert_mb / total_mb * 100.0);
+
+    // Step 2: Detect hardware
+    let total_ram_mb = {
+        #[cfg(target_os = "macos")]
+        {
+            let output = Command::new("sysctl").arg("-n").arg("hw.memsize").output();
+            match output {
+                Ok(o) => {
+                    let bytes: u64 = String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0);
+                    (bytes / 1024 / 1024) as f64
+                }
+                Err(_) => 24576.0, // fallback 24GB
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        { 24576.0 }
+    };
+    println!("RAM:      {:.0} MB", total_ram_mb);
+
+    // Step 3: Select strategy
+    let selected_strategy = if strategy != "auto" {
+        strategy.to_string()
+    } else if n_experts <= 1 {
+        println!("Strategy: full-ram (not a MoE model)");
+        "full-ram".to_string()
+    } else if total_mb < total_ram_mb * 0.8 {
+        println!("Strategy: full-ram (model fits in memory)");
+        "full-ram".to_string()
+    } else {
+        println!("Strategy: flash-ssd (model {:.1} GB > {:.0}% of RAM {:.1} GB)",
+            total_mb / 1024.0, 80.0, total_ram_mb / 1024.0);
+        "flash-ssd".to_string()
+    };
+
+    // Step 4: Find llama-server binary
+    let server_bin = if let Some(path) = llama_server_path {
+        path.to_string()
+    } else {
+        // Search common locations
+        let candidates = [
+            "llama.cpp/build/bin/llama-server",
+            "../llama.cpp/build/bin/llama-server",
+            "/usr/local/bin/llama-server",
+        ];
+        let mut found = None;
+        for c in &candidates {
+            let p = std::path::Path::new(c);
+            if p.exists() {
+                found = Some(c.to_string());
+                break;
+            }
+        }
+        // Also check relative to binary location
+        if found.is_none() {
+            if let Ok(exe) = std::env::current_exe() {
+                let dir = exe.parent().unwrap_or(std::path::Path::new("."));
+                let candidate = dir.join("../../llama.cpp/build/bin/llama-server");
+                if candidate.exists() {
+                    found = Some(candidate.to_string_lossy().to_string());
+                }
+            }
+        }
+        match found {
+            Some(f) => f,
+            None => {
+                anyhow::bail!("Could not find llama-server binary. Build it with:\n  cd llama.cpp && cmake -B build -DGGML_METAL=ON -DLLAMA_BUILD_SERVER=ON && cmake --build build --target llama-server\nOr specify with --llama-server <path>");
+            }
+        }
+    };
+    println!("Backend:  {}", server_bin);
+
+    // Step 5: Prepare based on strategy
+    let mut env_vars: Vec<(String, String)> = Vec::new();
+    let mut extra_args: Vec<String> = Vec::new();
+
+    match selected_strategy.as_str() {
+        "flash-ssd" => {
+            // Check if experts are already repacked
+            let model_dir = std::path::Path::new(model_path).parent().unwrap_or(std::path::Path::new("."));
+            let model_stem = std::path::Path::new(model_path)
+                .file_stem().and_then(|s| s.to_str()).unwrap_or("model");
+            let experts_dir = model_dir.join(format!("{}.experts", model_stem));
+
+            if !experts_dir.exists() || !experts_dir.join("manifest.json").exists() {
+                println!("\nExperts not repacked yet. Running repack...");
+                repack_experts(model_path, Some(experts_dir.to_str().unwrap()))?;
+            }
+
+            // Determine experts to pin
+            let mut pin_list: Vec<usize> = Vec::new();
+            if pin_top > 0 && n_experts > 0 {
+                // Run router analysis to find hot experts
+                let mut expert_norms: Vec<(usize, f64)> = Vec::new();
+                let emb_dim = gguf.embedding_dim().unwrap_or(0) as usize;
+                for e in 0..n_experts {
+                    let mut total_norm = 0.0f64;
+                    let mut layers_counted = 0;
+                    for layer in 0..n_layers {
+                        let gate_name = format!("blk.{}.ffn_gate_inp.weight", layer);
+                        if let Some(tensor) = gguf.find_tensor(&gate_name) {
+                            if tensor.dtype == llamactl_engine::gguf::GgmlType::F32 {
+                                let data = gguf.tensor_data(tensor);
+                                let floats: &[f32] = unsafe {
+                                    std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4)
+                                };
+                                let row_start = e * emb_dim;
+                                let row_end = row_start + emb_dim;
+                                if row_end <= floats.len() {
+                                    let norm: f64 = floats[row_start..row_end]
+                                        .iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+                                    total_norm += norm;
+                                    layers_counted += 1;
+                                }
+                            }
+                        }
+                    }
+                    if layers_counted > 0 {
+                        expert_norms.push((e, total_norm / layers_counted as f64));
+                    }
+                }
+                expert_norms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                pin_list = expert_norms.iter().take(pin_top).map(|(idx, _)| *idx).collect();
+            }
+
+            let pin_str = pin_list.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            let experts_path = experts_dir.to_string_lossy().to_string();
+
+            // Estimate RAM usage
+            let per_expert_mb = expert_mb / (n_layers * n_experts) as f64;
+            let pinned_mb = pin_list.len() as f64 * n_layers as f64 * per_expert_mb;
+            let shared_mb = expert_mb / n_experts as f64; // rough estimate for shared experts
+            let total_used = active_mb + pinned_mb + shared_mb + 500.0; // 500MB for compute buffers
+
+            println!("\nFlash-SSD configuration:");
+            println!("  Experts dir:  {}", experts_path);
+            println!("  Active params on Metal: {:.0} MB", active_mb);
+            if !pin_list.is_empty() {
+                println!("  Pinned experts ({}): {:?}", pin_list.len(), &pin_list[..std::cmp::min(10, pin_list.len())]);
+                println!("  Pinned memory: {:.0} MB", pinned_mb);
+            }
+            println!("  Shared cache: ~{:.0} MB", shared_mb);
+            println!("  Est. total RAM: {:.0} MB / {:.0} MB ({:.0}%)",
+                total_used, total_ram_mb, total_used / total_ram_mb * 100.0);
+
+            if total_used > total_ram_mb * 0.9 {
+                println!("  WARNING: May exceed available RAM. Reduce --pin-top or --ctx.");
+            }
+
+            env_vars.push(("LLAMA_FLASH_EXPERT".into(), experts_path));
+            if !pin_str.is_empty() {
+                env_vars.push(("LLAMA_PIN_EXPERTS".into(), pin_str));
+            }
+            extra_args.push("--no-mmap".into());
+            extra_args.push("--no-warmup".into());
+        }
+        "full-ram" => {
+            // Nothing special — just run llama-server normally
+        }
+        other => {
+            anyhow::bail!("Unknown strategy: {}. Use 'auto', 'full-ram', or 'flash-ssd'.", other);
+        }
+    }
+
+    // Step 6: Launch llama-server
+    println!("\nStarting llama-server on port {}...", port);
+
+    let mut cmd = Command::new(&server_bin);
+    cmd.arg("--model").arg(model_path)
+       .arg("-ngl").arg("999")
+       .arg("--port").arg(port.to_string())
+       .arg("-c").arg(ctx.to_string());
+
+    for arg in &extra_args {
+        cmd.arg(arg);
+    }
+    for (k, v) in &env_vars {
+        cmd.env(k, v);
+    }
+
+    println!("Command:  {} {}", server_bin, cmd.get_args()
+        .map(|a| a.to_string_lossy().to_string())
+        .collect::<Vec<_>>().join(" "));
+    for (k, v) in &env_vars {
+        println!("  {}={}", k, v);
+    }
+
+    let mut child = cmd.spawn().context("Failed to start llama-server")?;
+
+    // Wait for health check
+    println!("\nWaiting for server to be ready...");
+    let client = reqwest::Client::new();
+    let health_url = format!("http://127.0.0.1:{}/health", port);
+    let mut ready = false;
+    for i in 0..300 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if let Ok(resp) = client.get(&health_url).send().await {
+            if let Ok(text) = resp.text().await {
+                if text.contains("ok") {
+                    println!("Server ready! ({}s)\n", i + 1);
+                    ready = true;
+                    break;
+                }
+            }
+        }
+        if i % 15 == 14 {
+            println!("  Still loading... ({}s)", i + 1);
+        }
+    }
+
+    if !ready {
+        println!("Server failed to start within 300 seconds.");
+        child.kill().ok();
+        anyhow::bail!("Server startup timeout");
+    }
+
+    println!("OpenAI-compatible API running at http://127.0.0.1:{}/v1", port);
+    println!("  Chat: curl http://127.0.0.1:{}/v1/chat/completions -H 'Content-Type: application/json' -d '{{\"model\":\"m\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}]}}'", port);
+    println!("\nPress Ctrl+C to stop.");
+
+    // Wait for the child process
+    let status = child.wait().context("llama-server process failed")?;
+    if !status.success() {
+        println!("llama-server exited with: {}", status);
     }
 
     Ok(())

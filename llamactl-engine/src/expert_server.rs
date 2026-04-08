@@ -83,7 +83,7 @@ impl ExpertCompute for ExpertWorker {
         let k = req.k as usize;
         let batch = req.batch_size as usize;
         let seq_len = req.seq_len as usize;
-        let n_tokens = batch * seq_len;
+        let _n_tokens = batch * seq_len;
 
         // Reconstruct expert indices and weights tensors
         let indices = Tensor::from_vec(

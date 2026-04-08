@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::path::Path;
 
-use crate::ops::{categorize_tensors, CategorizedTensor, DevicePlacement, TensorCategory};
+use crate::ops::{categorize_tensors, CategorizedTensor, DevicePlacement};
 
 /// A loaded model split across devices
 pub struct LoadedModel {
