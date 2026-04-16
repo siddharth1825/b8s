@@ -107,6 +107,10 @@ enum Commands {
         /// Trades quality for speed — the model was trained at its native K.
         #[arg(long)]
         experts_used: Option<u32>,
+        /// Number of parallel server slots (passes --parallel N to llama-server).
+        /// Use 1 for clean single-request benchmarking.
+        #[arg(long)]
+        parallel: Option<u32>,
     },
     /// Benchmark inference: local-only and split modes
     Bench {
@@ -192,8 +196,8 @@ async fn main() -> Result<()> {
         Commands::Top => tui::run(&cli.server).await?,
         Commands::Analyze { model, load } => analyze_model(&model, load)?,
         Commands::Repack { model, output } => repack_experts(&model, output.as_deref())?,
-        Commands::Serve { model, port, ctx, pin_top, strategy, llama_server, experts_used } =>
-            serve_model(&model, port, ctx, pin_top, &strategy, llama_server.as_deref(), experts_used).await?,
+        Commands::Serve { model, port, ctx, pin_top, strategy, llama_server, experts_used, parallel } =>
+            serve_model(&model, port, ctx, pin_top, &strategy, llama_server.as_deref(), experts_used, parallel).await?,
         Commands::Bench { model, expert_addr, n_tokens, cpu } => bench_inference(&model, expert_addr.as_deref(), n_tokens, cpu).await?,
     }
 
@@ -491,6 +495,7 @@ async fn serve_model(
     strategy: &str,
     llama_server_path: Option<&str>,
     experts_used: Option<u32>,
+    parallel: Option<u32>,
 ) -> Result<()> {
     use llamactl_engine::{GgufFile, categorize_tensors, TensorCategory, DevicePlacement};
     use std::collections::HashMap;
@@ -680,6 +685,13 @@ async fn serve_model(
         other => {
             anyhow::bail!("Unknown strategy: {}. Use 'auto', 'full-ram', or 'flash-ssd'.", other);
         }
+    }
+
+    // Parallel server slots
+    if let Some(np) = parallel {
+        println!("Parallel slots: {}", np);
+        extra_args.push("--parallel".into());
+        extra_args.push(np.to_string());
     }
 
     // Runtime top-K override: --override-kv <arch>.expert_used_count=int:K
