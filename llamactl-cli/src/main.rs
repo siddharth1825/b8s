@@ -103,6 +103,10 @@ enum Commands {
         /// Path to llama-server binary (auto-detected if not specified)
         #[arg(long)]
         llama_server: Option<String>,
+        /// Override top-K routed experts at runtime (e.g. 4 to halve expert compute on K=8 models).
+        /// Trades quality for speed — the model was trained at its native K.
+        #[arg(long)]
+        experts_used: Option<u32>,
     },
     /// Benchmark inference: local-only and split modes
     Bench {
@@ -188,8 +192,8 @@ async fn main() -> Result<()> {
         Commands::Top => tui::run(&cli.server).await?,
         Commands::Analyze { model, load } => analyze_model(&model, load)?,
         Commands::Repack { model, output } => repack_experts(&model, output.as_deref())?,
-        Commands::Serve { model, port, ctx, pin_top, strategy, llama_server } =>
-            serve_model(&model, port, ctx, pin_top, &strategy, llama_server.as_deref()).await?,
+        Commands::Serve { model, port, ctx, pin_top, strategy, llama_server, experts_used } =>
+            serve_model(&model, port, ctx, pin_top, &strategy, llama_server.as_deref(), experts_used).await?,
         Commands::Bench { model, expert_addr, n_tokens, cpu } => bench_inference(&model, expert_addr.as_deref(), n_tokens, cpu).await?,
     }
 
@@ -486,6 +490,7 @@ async fn serve_model(
     pin_top: usize,
     strategy: &str,
     llama_server_path: Option<&str>,
+    experts_used: Option<u32>,
 ) -> Result<()> {
     use llamactl_engine::{GgufFile, categorize_tensors, TensorCategory, DevicePlacement};
     use std::collections::HashMap;
@@ -675,6 +680,18 @@ async fn serve_model(
         other => {
             anyhow::bail!("Unknown strategy: {}. Use 'auto', 'full-ram', or 'flash-ssd'.", other);
         }
+    }
+
+    // Runtime top-K override: --override-kv <arch>.expert_used_count=int:K
+    if let Some(k) = experts_used {
+        let arch = gguf.architecture().unwrap_or("");
+        if arch.is_empty() {
+            anyhow::bail!("--experts-used set but could not read general.architecture from GGUF");
+        }
+        let override_kv = format!("{}.expert_used_count=int:{}", arch, k);
+        println!("Top-K override: {} → {} (native: {})", n_experts_used, k, n_experts_used);
+        extra_args.push("--override-kv".into());
+        extra_args.push(override_kv);
     }
 
     // Step 6: Launch llama-server
